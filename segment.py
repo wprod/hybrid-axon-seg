@@ -50,13 +50,13 @@ MASK_ERODE_PX = 4   # px stripped from fiber boundary before inversion
 _FADE_PX      = 8   # px of soft fade inside the eroded boundary
 MIN_AXON_SIZE = 40  # min axon area (px²)
 
-# QC filters
-MIN_GRATIO          = 0.2
-MAX_GRATIO          = 0.8
-MIN_AXON_DIAM_UM    = 1.0
-MIN_SOLIDITY        = 0.65
-MAX_CENTROID_OFFSET = 0.4
-MAX_AXON_ECCEN      = 0.95
+# QC filters  (permissive — clinician adjusts)
+MIN_GRATIO          = 0.1
+MAX_GRATIO          = 0.95
+MIN_AXON_DIAM_UM    = 0.5
+MIN_SOLIDITY        = 0.4
+MAX_CENTROID_OFFSET = 0.65
+MAX_AXON_ECCEN      = 0.99
 EXCLUDE_BORDER      = True
 # ────────────────────────────────────────────────────────────────────────
 
@@ -284,7 +284,8 @@ def process_fibers(
             "centroid_offset":  centroid_offset,
             "x0": x0, "y0": y0,
             "image_border_touching": border,
-            "_label": axon_id,
+            "_label":       axon_id,
+            "_fiber_label": fiber_label,
         })
 
     df = pd.DataFrame(rows)
@@ -309,47 +310,67 @@ def process_fibers(
 # ──────────────── QC ───────────────────────────────────────────────────
 
 def apply_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    keep = pd.Series(True, index=df.index)
+    filters = {}
     if "gratio" in df.columns:
-        keep &= df["gratio"].notna() & df["gratio"].between(MIN_GRATIO, MAX_GRATIO)
-    keep &= df["axon_diam"] >= MIN_AXON_DIAM_UM
+        filters["gratio"]    = ~(df["gratio"].notna() & df["gratio"].between(MIN_GRATIO, MAX_GRATIO))
+    filters["axon_diam"]     = df["axon_diam"] < MIN_AXON_DIAM_UM
     if "solidity" in df.columns:
-        keep &= df["solidity"] >= MIN_SOLIDITY
+        filters["solidity"]  = df["solidity"] < MIN_SOLIDITY
     if "eccentricity" in df.columns:
-        keep &= df["eccentricity"] <= MAX_AXON_ECCEN
+        filters["eccen"]     = df["eccentricity"] > MAX_AXON_ECCEN
     if "centroid_offset" in df.columns:
-        keep &= df["centroid_offset"] <= MAX_CENTROID_OFFSET
+        filters["offset"]    = df["centroid_offset"] > MAX_CENTROID_OFFSET
     if EXCLUDE_BORDER and "image_border_touching" in df.columns:
-        keep &= ~df["image_border_touching"].fillna(False).astype(bool)
-    return df[keep].copy(), df[~keep].copy()
+        filters["border"]    = df["image_border_touching"].fillna(False).astype(bool)
+
+    reject = pd.Series(False, index=df.index)
+    for name, mask in filters.items():
+        n = int(mask.sum())
+        if n:
+            print(f"         QC [{name}]: {n} rejected")
+        reject |= mask
+
+    return df[~reject].copy(), df[reject].copy()
 
 
 # ──────────────── Visualizations ───────────────────────────────────────
 
-def _make_overlay(img, outer_labels, inner_labels, pairs):
+def _make_overlay(img, outer_labels, inner_labels, df_pass, df_rej):
+    """
+    RED    = fiber with no axon detected
+    ORANGE = axon detected but rejected by QC
+    BLUE   = myelin ring of a QC-passed fiber
+    GREEN  = axon of a QC-passed fiber
+    """
     rgb = to_rgb_uint8(img)
     overlay = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
 
-    matched_outer = np.array(list(pairs.keys()), dtype=np.int32) if pairs else np.array([], dtype=np.int32)
-    fiber_mask  = np.isin(outer_labels, matched_outer)
-    axon_mask   = inner_labels > 0
-    myelin_mask = fiber_mask & ~axon_mask
-    unmatched   = (outer_labels > 0) & ~fiber_mask
+    pass_fibers = set(df_pass["_fiber_label"].tolist()) if len(df_pass) else set()
+    rej_fibers  = set(df_rej["_fiber_label"].tolist())  if len(df_rej)  else set()
 
-    if unmatched.any():
-        overlay[unmatched] = np.clip(
-            overlay[unmatched].astype(np.float32) * 0.4
-            + np.array([200, 50, 50], dtype=np.float32) * 0.6, 0, 255,
+    def _blend(mask, color, alpha=0.6):
+        c = np.array(color, dtype=np.float32)
+        overlay[mask] = np.clip(
+            overlay[mask].astype(np.float32) * (1 - alpha) + c * alpha, 0, 255,
         ).astype(np.uint8)
-    overlay[myelin_mask] = np.clip(
-        overlay[myelin_mask].astype(np.float32) * 0.4
-        + np.array([60, 60, 255], dtype=np.float32) * 0.6, 0, 255,
-    ).astype(np.uint8)
-    overlay[axon_mask] = np.clip(
-        overlay[axon_mask].astype(np.float32) * 0.4
-        + np.array([0, 200, 0], dtype=np.float32) * 0.6, 0, 255,
-    ).astype(np.uint8)
 
+    # No axon detected → red
+    no_axon = (outer_labels > 0) & (inner_labels == 0)
+    _blend(no_axon, [220, 50, 50])
+
+    # QC-rejected: axon orange, myelin ring light-orange
+    rej_axon   = np.isin(inner_labels, list(rej_fibers)) & (inner_labels > 0)
+    rej_myelin = np.isin(outer_labels, list(rej_fibers)) & ~rej_axon & (inner_labels == 0)
+    _blend(rej_myelin, [200, 120,  30], alpha=0.4)
+    _blend(rej_axon,   [255, 140,   0])
+
+    # QC-passed: myelin blue, axon green
+    pass_axon   = np.isin(inner_labels, list(pass_fibers)) & (inner_labels > 0)
+    pass_myelin = np.isin(outer_labels, list(pass_fibers)) & ~pass_axon
+    _blend(pass_myelin, [ 60,  60, 255])
+    _blend(pass_axon,   [  0, 200,   0])
+
+    # Boundaries
     outer_c = morphology.binary_dilation(find_boundaries(outer_labels, mode="thick"), morphology.disk(1))
     inner_c = morphology.binary_dilation(find_boundaries(inner_labels, mode="thick"), morphology.disk(1))
     overlay[outer_c] = [80, 80, 255]
@@ -530,7 +551,7 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     pd.DataFrame([agg]).to_csv(out_dir / f"{stem}_aggregate.csv", index=False)
 
     print("  Generating visualizations\u2026")
-    overlay = _make_overlay(img, outer_labels, inner_labels, pairs)
+    overlay = _make_overlay(img, outer_labels, inner_labels, df_pass, df_rej)
     io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
 
     numbered = _make_numbered(overlay, df_pass, n_outer, stem)
