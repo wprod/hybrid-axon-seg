@@ -51,8 +51,8 @@ _FADE_PX      = 8   # px of soft fade inside the eroded boundary
 MIN_AXON_SIZE = 40  # min axon area (px²)
 
 # QC filters  (permissive — clinician adjusts)
-MIN_GRATIO          = 0.1
-MAX_GRATIO          = 0.95
+MIN_GRATIO          = 0.215
+MAX_GRATIO          = 0.9
 MIN_AXON_DIAM_UM    = 0.5
 MIN_SOLIDITY        = 0.4
 MAX_CENTROID_OFFSET = 0.65
@@ -309,38 +309,51 @@ def process_fibers(
 
 # ──────────────── QC ───────────────────────────────────────────────────
 
+_QC_REASON_LABEL = {
+    "gratio":    "G",
+    "axon_diam": "Ø",
+    "solidity":  "sol",
+    "eccen":     "ecc",
+    "offset":    "off",
+    "border":    "brd",
+}
+
 def apply_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     filters = {}
     if "gratio" in df.columns:
-        filters["gratio"]    = ~(df["gratio"].notna() & df["gratio"].between(MIN_GRATIO, MAX_GRATIO))
-    filters["axon_diam"]     = df["axon_diam"] < MIN_AXON_DIAM_UM
+        filters["gratio"]   = ~(df["gratio"].notna() & df["gratio"].between(MIN_GRATIO, MAX_GRATIO))
+    filters["axon_diam"]    = df["axon_diam"] < MIN_AXON_DIAM_UM
     if "solidity" in df.columns:
-        filters["solidity"]  = df["solidity"] < MIN_SOLIDITY
+        filters["solidity"] = df["solidity"] < MIN_SOLIDITY
     if "eccentricity" in df.columns:
-        filters["eccen"]     = df["eccentricity"] > MAX_AXON_ECCEN
+        filters["eccen"]    = df["eccentricity"] > MAX_AXON_ECCEN
     if "centroid_offset" in df.columns:
-        filters["offset"]    = df["centroid_offset"] > MAX_CENTROID_OFFSET
+        filters["offset"]   = df["centroid_offset"] > MAX_CENTROID_OFFSET
     if EXCLUDE_BORDER and "image_border_touching" in df.columns:
-        filters["border"]    = df["image_border_touching"].fillna(False).astype(bool)
+        filters["border"]   = df["image_border_touching"].fillna(False).astype(bool)
 
     reject = pd.Series(False, index=df.index)
+    reason = pd.Series("",    index=df.index, dtype=str)
     for name, mask in filters.items():
         n = int(mask.sum())
         if n:
             print(f"         QC [{name}]: {n} rejected")
+        reason.loc[(reason == "") & mask] = _QC_REASON_LABEL.get(name, name[:3])
         reject |= mask
 
-    return df[~reject].copy(), df[reject].copy()
+    df_rej = df[reject].copy()
+    df_rej["reject_reason"] = reason[reject].values
+    return df[~reject].copy(), df_rej
 
 
 # ──────────────── Visualizations ───────────────────────────────────────
 
 def _make_overlay(img, outer_labels, inner_labels, df_pass, df_rej):
     """
-    RED    = fiber with no axon detected
-    ORANGE = axon detected but rejected by QC
-    BLUE   = myelin ring of a QC-passed fiber
-    GREEN  = axon of a QC-passed fiber
+    RED    = no axon detected
+    ORANGE = axon detected, rejected by QC  (reason code printed on fiber)
+    BLUE   = myelin ring — QC passed
+    GREEN  = axon — QC passed
     """
     rgb = to_rgb_uint8(img)
     overlay = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
@@ -354,28 +367,80 @@ def _make_overlay(img, outer_labels, inner_labels, df_pass, df_rej):
             overlay[mask].astype(np.float32) * (1 - alpha) + c * alpha, 0, 255,
         ).astype(np.uint8)
 
-    # No axon detected → red
-    no_axon = (outer_labels > 0) & (inner_labels == 0)
-    _blend(no_axon, [220, 50, 50])
+    no_axon    = (outer_labels > 0) & (inner_labels == 0)
+    rej_axon   = np.isin(inner_labels, list(rej_fibers))  & (inner_labels > 0)
+    rej_myelin = np.isin(outer_labels, list(rej_fibers))  & ~rej_axon & (inner_labels == 0)
+    pass_axon  = np.isin(inner_labels, list(pass_fibers)) & (inner_labels > 0)
+    pass_myel  = np.isin(outer_labels, list(pass_fibers)) & ~pass_axon
 
-    # QC-rejected: axon orange, myelin ring light-orange
-    rej_axon   = np.isin(inner_labels, list(rej_fibers)) & (inner_labels > 0)
-    rej_myelin = np.isin(outer_labels, list(rej_fibers)) & ~rej_axon & (inner_labels == 0)
-    _blend(rej_myelin, [200, 120,  30], alpha=0.4)
+    _blend(no_axon,    [220,  50,  50])
+    _blend(rej_myelin, [200, 120,  30], alpha=0.35)
     _blend(rej_axon,   [255, 140,   0])
+    _blend(pass_myel,  [ 50,  50, 240])
+    _blend(pass_axon,  [  0, 210,  60])
 
-    # QC-passed: myelin blue, axon green
-    pass_axon   = np.isin(inner_labels, list(pass_fibers)) & (inner_labels > 0)
-    pass_myelin = np.isin(outer_labels, list(pass_fibers)) & ~pass_axon
-    _blend(pass_myelin, [ 60,  60, 255])
-    _blend(pass_axon,   [  0, 200,   0])
-
-    # Boundaries
     outer_c = morphology.binary_dilation(find_boundaries(outer_labels, mode="thick"), morphology.disk(1))
     inner_c = morphology.binary_dilation(find_boundaries(inner_labels, mode="thick"), morphology.disk(1))
-    overlay[outer_c] = [80, 80, 255]
-    overlay[inner_c] = [0, 255, 0]
-    return overlay
+    overlay[outer_c] = [70, 70, 220]
+    overlay[inner_c] = [0, 240, 80]
+
+    # ── PIL layer: rejection codes + legend ──────────────────────────
+    pil  = Image.fromarray(overlay)
+    draw = ImageDraw.Draw(pil)
+    font_code = _load_font(11)
+    font_leg  = _load_font(13)
+    font_title = _load_font(14)
+
+    # Rejection reason label on each orange fiber
+    if len(df_rej) and "reject_reason" in df_rej.columns:
+        for _, row in df_rej.iterrows():
+            reason = str(row.get("reject_reason", ""))
+            if not reason:
+                continue
+            x, y = int(row["x0"]), int(row["y0"])
+            draw.text((x - 5, y - 6), reason, fill=(0, 0, 0),       font=font_code)  # shadow
+            draw.text((x - 6, y - 7), reason, fill=(255, 220, 60),   font=font_code)
+
+    # Legend (bottom-left, semi-transparent dark box)
+    W, H    = pil.width, pil.height
+    lx, ly  = 18, H - 205
+    lw, lh  = 278, 185
+    arr = np.array(pil)
+    arr[ly:ly+lh, lx:lx+lw] = np.clip(
+        arr[ly:ly+lh, lx:lx+lw].astype(float) * 0.2 + np.array([18, 18, 18]) * 0.8,
+        0, 255,
+    ).astype(np.uint8)
+    pil  = Image.fromarray(arr)
+    draw = ImageDraw.Draw(pil)
+
+    # border around legend
+    draw.rectangle([lx, ly, lx+lw, ly+lh], outline=(90, 90, 90), width=1)
+
+    legend_entries = [
+        ([  0, 210,  60], "Axon — QC passed"),
+        ([ 50,  50, 240], "Myelin — QC passed"),
+        ([255, 140,   0], "Detected — QC rejected"),
+        ([220,  50,  50], "No axon detected"),
+    ]
+    codes_line = [
+        "Rejection codes:",
+        "G=g-ratio   Ø=diameter   sol=solidity",
+        "ecc=eccen.  off=offset   brd=border",
+    ]
+
+    y_cur = ly + 10
+    for color, label in legend_entries:
+        draw.rectangle([lx+10, y_cur+2, lx+23, y_cur+14], fill=tuple(color))
+        draw.text((lx+32, y_cur), label, fill=(230, 230, 230), font=font_leg)
+        y_cur += 23
+    draw.line([lx+8, y_cur+2, lx+lw-8, y_cur+2], fill=(70, 70, 70), width=1)
+    y_cur += 10
+    for line in codes_line:
+        clr = (200, 200, 200) if line == "Rejection codes:" else (155, 155, 155)
+        draw.text((lx+10, y_cur), line, fill=clr, font=font_code)
+        y_cur += 16
+
+    return np.array(pil)
 
 
 def _make_numbered(overlay, df, n_outer, stem):
