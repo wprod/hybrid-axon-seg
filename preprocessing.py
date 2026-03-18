@@ -24,9 +24,15 @@ from utils import to_uint8_gray
 
 
 def _invert_crop(crop_gray: np.ndarray, fiber_mask: np.ndarray) -> np.ndarray:
-    """Contrast-stretch + invert one fiber crop with a smooth inward fade."""
+    """Contrast-stretch + invert one fiber crop with a smooth inward fade.
+
+    Erosion is adaptive: capped at 25% of the fiber's equivalent radius so
+    that thin-myelin or small fibers don't lose their myelin signal entirely.
+    """
     dist = ndimage.distance_transform_edt(fiber_mask).astype(np.float32)
-    inner = dist > config.MASK_ERODE_PX
+    fiber_radius = float(dist.max())  # ≈ equivalent radius of this fiber
+    erode_px = min(config.MASK_ERODE_PX, max(1, fiber_radius * 0.25))
+    inner = dist > erode_px
     if not inner.any():
         inner = fiber_mask
 

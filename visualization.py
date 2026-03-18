@@ -4,7 +4,7 @@ Color scheme
 ------------
   GREEN  / teal-green boundary  = axon (QC passed)
   BLUE   / blue boundary        = myelin ring (QC passed)
-  ORANGE + rejection code label = detected axon, rejected by QC
+  ORANGE + pill badge           = detected axon, rejected by QC
   RED                           = fiber with no axon detected
 """
 
@@ -27,8 +27,145 @@ from utils import load_font, to_rgb_uint8
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# ── Design tokens ─────────────────────────────────────────────────────────────
 
-# ── Overlay ──────────────────────────────────────────────────────────────────
+_CLR = {
+    "axon": "#27AE60",
+    "myelin": "#2980B9",
+    "rej": "#E67E22",
+    "noaxon": "#E74C3C",
+    "bg": "#F8F9FA",
+    "grid": "#E9ECEF",
+    "text": "#2C3E50",
+    "muted": "#95A5A6",
+    "header": "#2C3E50",
+}
+
+_DASH_STYLE = {
+    "figure.facecolor": _CLR["bg"],
+    "axes.facecolor": "#FFFFFF",
+    "axes.edgecolor": "#DEE2E6",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.color": _CLR["grid"],
+    "grid.linewidth": 0.8,
+    "axes.titlesize": 12,
+    "axes.titleweight": "bold",
+    "axes.titlecolor": _CLR["text"],
+    "axes.labelsize": 10,
+    "axes.labelcolor": _CLR["text"],
+    "xtick.labelsize": 9,
+    "ytick.labelsize": 9,
+    "xtick.color": _CLR["muted"],
+    "ytick.color": _CLR["muted"],
+    "legend.framealpha": 0.9,
+    "legend.edgecolor": _CLR["grid"],
+    "legend.fontsize": 8,
+}
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _hist_with_stats(ax, data, color, xlabel, title):
+    """Histogram + mean/median lines + stats annotation."""
+    if not len(data):
+        ax.set(xlabel=xlabel, title=title)
+        return
+    ax.hist(data, bins=30, color=color, edgecolor="white", linewidth=0.4, alpha=0.85)
+    mean, med, std = data.mean(), data.median(), data.std()
+    ax.axvline(mean, color=_CLR["text"], lw=1.5, ls="--", label=f"mean {mean:.2f}")
+    ax.axvline(med, color=_CLR["muted"], lw=1.2, ls=":", label=f"median {med:.2f}")
+    ax.legend(loc="upper right")
+    ax.text(
+        0.97,
+        0.93,
+        f"σ = {std:.2f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=8,
+        color=_CLR["muted"],
+    )
+    ax.set(xlabel=xlabel, ylabel="Count", title=title)
+
+
+def _scatter_colored(ax, x, y, c, cmap, norm, xlabel, ylabel, title, ref_line=None):
+    """Scatter colored by a continuous value + optional horizontal reference."""
+    if not len(x):
+        ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
+        return
+    sc = ax.scatter(x, y, c=c, cmap=cmap, norm=norm, s=12, alpha=0.7, linewidths=0)
+    plt.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
+    if ref_line is not None:
+        ax.axhline(ref_line, ls="--", color=_CLR["muted"], lw=1.0, label=f"ref {ref_line}")
+        ax.legend(loc="upper right")
+    # Pearson r
+    mask = np.isfinite(x) & np.isfinite(y)
+    if mask.sum() > 2:
+        r = float(np.corrcoef(x[mask], y[mask])[0, 1])
+        ax.text(
+            0.03,
+            0.95,
+            f"r = {r:.2f}",
+            transform=ax.transAxes,
+            va="top",
+            fontsize=8,
+            color=_CLR["muted"],
+        )
+    ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
+
+
+def _styled_table(ax, rows, n_pass, n_rej):
+    """Render a metrics table with a dark header and alternating row shading."""
+    ax.axis("off")
+    col_labels = ["Metric", "Value"]
+
+    tbl = ax.table(
+        cellText=rows,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="left",
+        bbox=[0.0, 0.0, 1.0, 1.0],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9.5)
+
+    n_rows = len(rows)
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#DEE2E6")
+        cell.set_linewidth(0.5)
+        if r == 0:  # header
+            cell.set_facecolor(_CLR["header"])
+            cell.set_text_props(color="white", weight="bold")
+            cell.set_height(0.085)
+        elif r % 2 == 0:
+            cell.set_facecolor("#F8F9FA")
+        else:
+            cell.set_facecolor("#FFFFFF")
+        if r > 0:
+            cell.set_height(0.072)
+
+    # Colour-code a few key cells
+    key_rows = {
+        r: rows[r - 1]
+        for r in range(1, n_rows + 1)
+        if rows[r - 1][0] in ("Passed QC", "Rejected QC", "Aggr. G-ratio", "AVF", "MVF")
+    }
+    for r, (label, value) in key_rows.items():
+        val_cell = tbl[r, 1]
+        if label == "Passed QC":
+            val_cell.set_facecolor("#D5F5E3")
+        elif label == "Rejected QC":
+            val_cell.set_facecolor("#FADBD8")
+        elif label in ("Aggr. G-ratio", "AVF", "MVF"):
+            val_cell.set_facecolor("#D6EAF8")
+
+    ax.set_title("QC & Aggregate Metrics", pad=10)
+
+
+# ── Overlay ───────────────────────────────────────────────────────────────────
 
 
 def make_overlay(
@@ -38,12 +175,7 @@ def make_overlay(
     df_pass: pd.DataFrame,
     df_rej: pd.DataFrame,
 ) -> np.ndarray:
-    """Build the colour-coded overlay image (returned as H×W×3 uint8 array).
-
-    Layer order (back → front):
-      dim background → red (no axon) → orange myelin → orange axon
-      → blue myelin → green axon → boundaries → PIL text/legend
-    """
+    """Build the colour-coded overlay image (returned as H×W×3 uint8 array)."""
     rgb = to_rgb_uint8(img)
     overlay = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
 
@@ -60,12 +192,12 @@ def make_overlay(
 
     no_axon = (outer_labels > 0) & (inner_labels == 0)
     rej_axon = np.isin(inner_labels, list(rej_fibers)) & (inner_labels > 0)
-    rej_myelin = np.isin(outer_labels, list(rej_fibers)) & ~rej_axon & (inner_labels == 0)
+    rej_myel = np.isin(outer_labels, list(rej_fibers)) & ~rej_axon & (inner_labels == 0)
     pass_axon = np.isin(inner_labels, list(pass_fibers)) & (inner_labels > 0)
     pass_myel = np.isin(outer_labels, list(pass_fibers)) & ~pass_axon
 
     _blend(no_axon, [220, 50, 50])
-    _blend(rej_myelin, [200, 120, 30], alpha=0.35)
+    _blend(rej_myel, [200, 120, 30], alpha=0.35)
     _blend(rej_axon, [255, 140, 0])
     _blend(pass_myel, [50, 50, 240])
     _blend(pass_axon, [0, 210, 60])
@@ -79,58 +211,77 @@ def make_overlay(
     overlay[outer_c] = [70, 70, 220]
     overlay[inner_c] = [0, 240, 80]
 
-    # ── PIL layer: rejection codes + legend ──────────────────────────────
+    # ── PIL layer ─────────────────────────────────────────────────────────
     pil = Image.fromarray(overlay)
     draw = ImageDraw.Draw(pil)
-    font_code = load_font(11)
+    font_code = load_font(12)
     font_leg = load_font(13)
 
-    # Rejection reason label on each orange fiber
+    # Rejection badges: dark pill with orange border + yellow text
     if len(df_rej) and "reject_reason" in df_rej.columns:
+        PAD = 4
         for _, row in df_rej.iterrows():
             reason = str(row.get("reject_reason", ""))
             if not reason:
                 continue
             x, y = int(row["x0"]), int(row["y0"])
-            draw.text((x - 5, y - 6), reason, fill=(0, 0, 0), font=font_code)  # shadow
-            draw.text((x - 6, y - 7), reason, fill=(255, 220, 60), font=font_code)
+            tx, ty = x - 7, y - 8
+            # measure text bounding box
+            bb = draw.textbbox((tx, ty), reason, font=font_code)
+            # pill background
+            draw.rectangle(
+                [bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD],
+                fill=(25, 15, 0),
+                outline=(255, 160, 30),
+                width=1,
+            )
+            draw.text((tx, ty), reason, fill=(255, 225, 80), font=font_code)
 
-    # Legend: semi-transparent dark box in the bottom-left corner
+    # Legend box
     _, H = pil.width, pil.height
-    lx, ly = 18, H - 205
-    lw, lh = 278, 185
+    lx, ly = 18, H - 210
+    lw, lh = 290, 192
     arr = np.array(pil)
     arr[ly : ly + lh, lx : lx + lw] = np.clip(
-        arr[ly : ly + lh, lx : lx + lw].astype(float) * 0.2 + np.array([18, 18, 18]) * 0.8,
+        arr[ly : ly + lh, lx : lx + lw].astype(float) * 0.15 + np.array([18, 18, 18]) * 0.85,
         0,
         255,
     ).astype(np.uint8)
     pil = Image.fromarray(arr)
     draw = ImageDraw.Draw(pil)
-    draw.rectangle([lx, ly, lx + lw, ly + lh], outline=(90, 90, 90), width=1)
 
-    legend_entries = [
+    # rounded border
+    draw.rectangle([lx, ly, lx + lw, ly + lh], outline=(100, 100, 110), width=1)
+
+    entries = [
         ([0, 210, 60], "Axon — QC passed"),
         ([50, 50, 240], "Myelin — QC passed"),
         ([255, 140, 0], "Detected — QC rejected"),
         ([220, 50, 50], "No axon detected"),
     ]
-    codes_lines = [
+    codes = [
         "Rejection codes:",
-        "G=g-ratio   Ø=diameter   sol=solidity",
-        "ecc=eccen.  off=offset   brd=border",
+        "G = g-ratio    Ø = diameter    sol = solidity",
+        "ecc = eccen.   off = offset    brd = border",
     ]
-    y_cur = ly + 10
-    for color, label in legend_entries:
-        draw.rectangle([lx + 10, y_cur + 2, lx + 23, y_cur + 14], fill=tuple(color))
-        draw.text((lx + 32, y_cur), label, fill=(230, 230, 230), font=font_leg)
-        y_cur += 23
-    draw.line([lx + 8, y_cur + 2, lx + lw - 8, y_cur + 2], fill=(70, 70, 70), width=1)
-    y_cur += 10
-    for line in codes_lines:
-        clr = (200, 200, 200) if line == "Rejection codes:" else (155, 155, 155)
-        draw.text((lx + 10, y_cur), line, fill=clr, font=load_font(11))
-        y_cur += 16
+
+    y_cur = ly + 12
+    for color, label in entries:
+        # circle swatch instead of square
+        cx_sw, cy_sw = lx + 18, y_cur + 8
+        draw.ellipse([cx_sw - 7, cy_sw - 7, cx_sw + 7, cy_sw + 7], fill=tuple(color))
+        draw.text((lx + 34, y_cur), label, fill=(230, 230, 230), font=font_leg)
+        y_cur += 25
+
+    # divider
+    draw.line([lx + 10, y_cur, lx + lw - 10, y_cur], fill=(70, 70, 80), width=1)
+    y_cur += 8
+
+    for i, line in enumerate(codes):
+        clr = (210, 210, 220) if i == 0 else (150, 150, 160)
+        fnt = load_font(11) if i > 0 else load_font(12)
+        draw.text((lx + 12, y_cur), line, fill=clr, font=fnt)
+        y_cur += 17
 
     return np.array(pil)
 
@@ -163,15 +314,15 @@ def make_numbered(
     mean_fi = df["fiber_diam"].mean() if n else 0
     mean_g = df["gratio"].mean() if n else 0
 
-    banner_h = 40
-    canvas = Image.new("RGB", (pil.width, pil.height + banner_h), (30, 30, 30))
+    banner_h = 44
+    canvas = Image.new("RGB", (pil.width, pil.height + banner_h), (22, 28, 36))
     canvas.paste(pil, (0, banner_h))
     d = ImageDraw.Draw(canvas)
     d.text(
-        (10, 10),
-        f"  n={n}/{n_outer}   axon={mean_ax:.2f}µm   "
-        f"fiber={mean_fi:.2f}µm   G={mean_g:.3f}  —  {stem}",
-        fill=(255, 255, 255),
+        (14, 12),
+        f"n = {n} / {n_outer}     axon = {mean_ax:.2f} µm"
+        f"     fiber = {mean_fi:.2f} µm     G = {mean_g:.3f}     {stem}",
+        fill=(220, 220, 230),
         font=font_banner,
     )
     return np.array(canvas)
@@ -188,7 +339,8 @@ def make_gratio_map(
 ) -> None:
     """Save a per-axon g-ratio heatmap (RdYlGn colourmap) to *out_path*."""
     bg = (to_rgb_uint8(img).astype(np.float32) * 0.3).astype(np.uint8)
-    fig, ax = plt.subplots(figsize=(12, 12))
+    fig, ax = plt.subplots(figsize=(12, 12), facecolor="#111111")
+    ax.set_facecolor("#111111")
     ax.imshow(bg)
 
     if "gratio" in df.columns and len(df) > 0:
@@ -203,10 +355,12 @@ def make_gratio_map(
         ax.imshow(rgba)
         sm = cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        plt.colorbar(sm, ax=ax, label="G-ratio", shrink=0.6, pad=0.02)
+        cb = plt.colorbar(sm, ax=ax, label="G-ratio", shrink=0.55, pad=0.02)
+        cb.ax.yaxis.label.set_color("white")
+        cb.ax.tick_params(colors="white")
 
     ax.axis("off")
-    fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
+    fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
 
 
@@ -222,68 +376,128 @@ def make_dashboard(
     stem: str,
     out_path,
 ) -> None:
-    """Save a 2×3 summary dashboard (histograms + scatter + metrics table)."""
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle(f"Morphometry Dashboard — {stem}", fontsize=14, weight="bold")
-    has_g = "gratio" in df.columns and len(df) > 0
-
-    if len(df):
-        axes[0, 0].hist(df["axon_diam"], bins=30, color="seagreen", edgecolor="k", alpha=0.8)
-    axes[0, 0].set(xlabel="Axon diameter (µm)", ylabel="Count", title="Axon diameter")
-
-    if has_g:
-        axes[0, 1].hist(df["gratio"], bins=30, color="steelblue", edgecolor="k", alpha=0.8)
-    axes[0, 1].set(xlabel="G-ratio", ylabel="Count", title="G-ratio")
-
-    if len(df) and "myelin_thickness" in df.columns:
-        axes[0, 2].hist(
-            df["myelin_thickness"], bins=30, color="mediumpurple", edgecolor="k", alpha=0.8
+    """Save a 2×3 publication-quality morphometry dashboard."""
+    with plt.rc_context(_DASH_STYLE):
+        fig = plt.figure(figsize=(20, 11), facecolor=_CLR["bg"])
+        fig.suptitle(
+            f"Nerve Morphometry  —  {stem}",
+            fontsize=15,
+            weight="bold",
+            color=_CLR["text"],
+            y=0.98,
         )
-    axes[0, 2].set(xlabel="Myelin thickness (µm)", ylabel="Count", title="Myelin thickness")
 
-    if has_g:
-        axes[1, 0].scatter(
-            df["axon_diam"], df["gratio"], s=15, alpha=0.6, c="steelblue", edgecolors="none"
+        gs = fig.add_gridspec(
+            2, 3, hspace=0.42, wspace=0.35, left=0.06, right=0.97, top=0.93, bottom=0.07
         )
-        axes[1, 0].axhline(0.6, ls="--", color="gray", lw=0.8, label="healthy ≈ 0.6")
-        axes[1, 0].legend(fontsize=8)
-    axes[1, 0].set(xlabel="Axon diameter (µm)", ylabel="G-ratio", title="G-ratio vs. diameter")
+        axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(2)]
 
-    if "myelin_thickness" in df.columns and len(df):
-        axes[1, 1].scatter(
-            df["axon_diam"],
-            df["myelin_thickness"],
-            s=15,
-            alpha=0.6,
-            c="mediumpurple",
-            edgecolors="none",
+        has_g = "gratio" in df.columns and len(df) > 0
+        norm_g = Normalize(vmin=config.MIN_GRATIO, vmax=config.MAX_GRATIO)
+        cmap_g = matplotlib.colormaps["RdYlGn"]
+
+        # ── row 0: histograms ─────────────────────────────────────────────
+        _hist_with_stats(
+            axes[0][0], df["axon_diam"], _CLR["axon"], "Axon diameter (µm)", "Axon diameter"
         )
-    axes[1, 1].set(
-        xlabel="Axon diameter (µm)", ylabel="Myelin thickness (µm)", title="Myelin vs. diameter"
-    )
+        _hist_with_stats(
+            axes[0][1],
+            df["gratio"] if has_g else pd.Series(dtype=float),
+            _CLR["myelin"],
+            "G-ratio",
+            "G-ratio",
+        )
+        _hist_with_stats(
+            axes[0][2],
+            df["myelin_thickness"] if "myelin_thickness" in df.columns else pd.Series(dtype=float),
+            "#8E44AD",
+            "Myelin thickness (µm)",
+            "Myelin thickness",
+        )
 
-    ax = axes[1, 2]
-    ax.axis("off")
-    tbl_rows = [
-        ["Fibers detected", str(n_outer)],
-        ["With axon", str(n_matched)],
-        ["Passed QC", str(len(df))],
-        ["Rejected QC", str(len(df_rej))],
-        ["", ""],
-        ["AVF", f"{agg.get('avf', 0):.4f}"],
-        ["MVF", f"{agg.get('mvf', 0):.4f}"],
-        ["Aggr. G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
-        ["Density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
-        ["Mean axon diam", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
-        ["Mean fiber diam", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
-        ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
-    ]
-    tbl = ax.table(cellText=tbl_rows, colLabels=["Metric", "Value"], loc="center", cellLoc="left")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(10)
-    tbl.scale(1.0, 1.4)
-    ax.set_title("QC & Aggregate Metrics")
+        # reference line on g-ratio histogram
+        if has_g:
+            axes[0][1].axvline(
+                0.6, color=_CLR["rej"], lw=1.2, ls="-.", label="optimal ≈ 0.6", zorder=3
+            )
+            axes[0][1].legend(loc="upper right")
 
-    plt.tight_layout()
-    fig.savefig(str(out_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
+        # ── row 1: scatter + table ────────────────────────────────────────
+        if has_g:
+            _scatter_colored(
+                axes[1][0],
+                x=df["axon_diam"].values,
+                y=df["gratio"].values,
+                c=df["gratio"].values,
+                cmap=cmap_g,
+                norm=norm_g,
+                xlabel="Axon diameter (µm)",
+                ylabel="G-ratio",
+                title="G-ratio vs. Axon diameter",
+                ref_line=0.6,
+            )
+        else:
+            axes[1][0].set(
+                xlabel="Axon diameter (µm)", ylabel="G-ratio", title="G-ratio vs. Axon diameter"
+            )
+
+        if "myelin_thickness" in df.columns and len(df):
+            _scatter_colored(
+                axes[1][1],
+                x=df["axon_diam"].values,
+                y=df["myelin_thickness"].values,
+                c=df["myelin_thickness"].values,
+                cmap=matplotlib.colormaps["plasma"],
+                norm=Normalize(
+                    vmin=df["myelin_thickness"].quantile(0.05),
+                    vmax=df["myelin_thickness"].quantile(0.95),
+                ),
+                xlabel="Axon diameter (µm)",
+                ylabel="Myelin thickness (µm)",
+                title="Myelin thickness vs. Axon diameter",
+            )
+        else:
+            axes[1][1].set(
+                xlabel="Axon diameter (µm)",
+                ylabel="Myelin thickness (µm)",
+                title="Myelin thickness vs. Axon diameter",
+            )
+
+        # ── metrics table ─────────────────────────────────────────────────
+        tbl_rows = [
+            ["Fibers detected", str(n_outer)],
+            ["With axon", str(n_matched)],
+            ["Passed QC", str(len(df))],
+            ["Rejected QC", str(len(df_rej))],
+            ["—", "—"],
+            ["AVF", f"{agg.get('avf', 0):.4f}"],
+            ["MVF", f"{agg.get('mvf', 0):.4f}"],
+            ["Aggr. G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
+            ["Density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
+            ["Mean axon diam", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["Mean fiber diam", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
+        ]
+        _styled_table(axes[1][2], tbl_rows, len(df), len(df_rej))
+
+        # ── QC pass/reject mini-bar in table panel top ────────────────────
+        total = len(df) + len(df_rej)
+        if total > 0:
+            inset = axes[1][2].inset_axes([0.0, 0.90, 1.0, 0.08])
+            inset.barh(0, len(df) / total, color="#27AE60", height=0.6)
+            inset.barh(0, len(df_rej) / total, color="#E74C3C", height=0.6, left=len(df) / total)
+            inset.set_xlim(0, 1)
+            inset.axis("off")
+            pct = len(df) / total * 100
+            inset.text(
+                0.01,
+                0,
+                f"  {pct:.0f}% pass",
+                va="center",
+                fontsize=7.5,
+                color="white",
+                weight="bold",
+            )
+
+        fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)

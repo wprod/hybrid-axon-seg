@@ -77,6 +77,20 @@ def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> dict:
             best = labeled == max(rprops, key=lambda r: r.area).label
 
         best = ndimage.binary_fill_holes(best) & p.image
+
+        # Smooth perimeter: Gaussian blur on the float mask, re-threshold at 0.5
+        if config.AXON_SMOOTH_SIGMA > 0:
+            best = (
+                ndimage.gaussian_filter(best.astype(np.float32), sigma=config.AXON_SMOOTH_SIGMA)
+                >= 0.5
+            ) & p.image
+
+        # Expand axon mask to compensate for Otsu under-segmentation at axon/myelin boundary
+        if config.AXON_DILATE_PX > 0:
+            best = (
+                morphology.binary_dilation(best, morphology.disk(config.AXON_DILATE_PX)) & p.image
+            )
+
         if best.sum() < config.MIN_AXON_SIZE:
             continue
 
