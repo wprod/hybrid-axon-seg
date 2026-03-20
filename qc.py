@@ -23,6 +23,7 @@ _REASON_LABEL: dict[str, str] = {
     "eccen": "ecc",
     "offset": "off",
     "border": "brd",
+    "large_lowG": "lgG",  # large fiber + g-ratio < LARGE_FIBER_MIN_GRATIO
 }
 
 
@@ -47,6 +48,11 @@ def apply_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         filters["offset"] = df["centroid_offset"] > config.MAX_CENTROID_OFFSET
     if config.EXCLUDE_BORDER and "image_border_touching" in df.columns:
         filters["border"] = df["image_border_touching"].fillna(False).astype(bool)
+    if "fiber_diam" in df.columns and "gratio" in df.columns:
+        size_thresh = df["fiber_diam"].quantile(config.LARGE_FIBER_PERCENTILE / 100)
+        filters["large_lowG"] = (df["fiber_diam"] >= size_thresh) & (
+            df["gratio"] < config.LARGE_FIBER_MIN_GRATIO
+        )
 
     reject = pd.Series(False, index=df.index)
     reason = pd.Series("", index=df.index, dtype=str)

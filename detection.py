@@ -43,25 +43,37 @@ def run_cellpose_fibers(img: np.ndarray) -> np.ndarray:
     return masks
 
 
-def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> dict:
+def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> tuple[dict, set]:
     """Global Otsu on axon_input → per-fiber centroid-based blob selection.
 
     Returns
     -------
-    dict : fiber_label → (minr, minc, crop_bool)
-        crop_bool is a boolean mask relative to the fiber bounding-box.
+    tuple:
+        axon_assignments : dict  fiber_label → (minr, minc, crop_bool)
+            crop_bool is a boolean mask relative to the fiber bounding-box.
+        multicore_labels : set of fiber labels rejected for having 2+ dark cores.
     """
     fiber_pixels = axon_input[outer_labels > 0]
     thr = threshold_otsu(fiber_pixels)
     dark_mask = (axon_input <= thr) & (outer_labels > 0)
 
     result = {}
+    multicore_labels = set()
     for p in measure.regionprops(outer_labels):
         minr, minc, maxr, maxc = p.bbox
 
         crop_dark = dark_mask[minr:maxr, minc:maxc] & p.image
-        crop_dark = morphology.binary_closing(crop_dark, morphology.disk(1)) & p.image
 
+        # Multi-core check on RAW blobs (before any closing that could bridge them)
+        # Reject if the 2nd largest blob is ≥ 30% of the largest → true double-core
+        raw_labeled = measure.label(crop_dark)
+        raw_rprops = sorted(measure.regionprops(raw_labeled), key=lambda r: r.area, reverse=True)
+        if len(raw_rprops) >= 2 and raw_rprops[1].area >= raw_rprops[0].area * 0.30:
+            multicore_labels.add(p.label)
+            continue
+
+        # Now apply small closing to denoise before CC selection
+        crop_dark = morphology.binary_closing(crop_dark, morphology.disk(1)) & p.image
         labeled = measure.label(crop_dark)
         if labeled.max() == 0:
             continue
@@ -76,7 +88,12 @@ def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> dict:
             rprops = measure.regionprops(labeled)
             best = labeled == max(rprops, key=lambda r: r.area).label
 
-        best = ndimage.binary_fill_holes(best) & p.image
+        # Large closing bridges C-shape gaps without fully simplifying the shape,
+        # then clip to minimum myelin margin from the fiber boundary
+        dist = ndimage.distance_transform_edt(p.image).astype(np.float32)
+        margin_mask = dist > config.AXON_MIN_MYELIN_PX
+        best = morphology.binary_closing(best, morphology.disk(8)) & margin_mask
+        best = ndimage.binary_fill_holes(best) & margin_mask
 
         # Smooth perimeter: Gaussian blur on the float mask, re-threshold at 0.5
         if config.AXON_SMOOTH_SIGMA > 0:
@@ -96,4 +113,4 @@ def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> dict:
 
         result[p.label] = (minr, minc, best)
 
-    return result
+    return result, multicore_labels

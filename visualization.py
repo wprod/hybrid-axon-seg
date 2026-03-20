@@ -5,7 +5,8 @@ Color scheme
   GREEN  / teal-green boundary  = axon (QC passed)
   BLUE   / blue boundary        = myelin ring (QC passed)
   ORANGE + pill badge           = detected axon, rejected by QC
-  RED                           = fiber with no axon detected
+  PURPLE                        = multi-core fiber (2+ dark blobs → excluded)
+  RED                           = fiber with no axon detected (other)
 """
 
 import warnings
@@ -34,6 +35,7 @@ _CLR = {
     "myelin": "#2980B9",
     "rej": "#E67E22",
     "noaxon": "#E74C3C",
+    "multicore": "#8E44AD",
     "bg": "#F8F9FA",
     "grid": "#E9ECEF",
     "text": "#2C3E50",
@@ -151,14 +153,17 @@ def _styled_table(ax, rows, n_pass, n_rej):
     key_rows = {
         r: rows[r - 1]
         for r in range(1, n_rows + 1)
-        if rows[r - 1][0] in ("Passed QC", "Rejected QC", "Aggr. G-ratio", "AVF", "MVF")
+        if rows[r - 1][0]
+        in ("QC validé", "QC rejeté", "Multi-cœur (exclu)", "Aggr. G-ratio", "AVF", "MVF")
     }
     for r, (label, value) in key_rows.items():
         val_cell = tbl[r, 1]
-        if label == "Passed QC":
+        if label == "QC validé":
             val_cell.set_facecolor("#D5F5E3")
-        elif label == "Rejected QC":
+        elif label == "QC rejeté":
             val_cell.set_facecolor("#FADBD8")
+        elif label == "Multi-cœur (exclu)":
+            val_cell.set_facecolor("#E8DAEF")
         elif label in ("Aggr. G-ratio", "AVF", "MVF"):
             val_cell.set_facecolor("#D6EAF8")
 
@@ -174,6 +179,7 @@ def make_overlay(
     inner_labels: np.ndarray,
     df_pass: pd.DataFrame,
     df_rej: pd.DataFrame,
+    multicore_labels: set | None = None,
 ) -> np.ndarray:
     """Build the colour-coded overlay image (returned as H×W×3 uint8 array)."""
     rgb = to_rgb_uint8(img)
@@ -181,6 +187,7 @@ def make_overlay(
 
     pass_fibers = set(df_pass["_fiber_label"].tolist()) if len(df_pass) else set()
     rej_fibers = set(df_rej["_fiber_label"].tolist()) if len(df_rej) else set()
+    mc_fibers = multicore_labels if multicore_labels else set()
 
     def _blend(mask: np.ndarray, color: list, alpha: float = 0.6) -> None:
         c = np.array(color, dtype=np.float32)
@@ -190,13 +197,16 @@ def make_overlay(
             255,
         ).astype(np.uint8)
 
-    no_axon = (outer_labels > 0) & (inner_labels == 0)
+    # Fibers with no axon: split by reason
+    multicore_mask = np.isin(outer_labels, list(mc_fibers)) & (inner_labels == 0)
+    no_axon = (outer_labels > 0) & (inner_labels == 0) & ~multicore_mask
     rej_axon = np.isin(inner_labels, list(rej_fibers)) & (inner_labels > 0)
     rej_myel = np.isin(outer_labels, list(rej_fibers)) & ~rej_axon & (inner_labels == 0)
     pass_axon = np.isin(inner_labels, list(pass_fibers)) & (inner_labels > 0)
     pass_myel = np.isin(outer_labels, list(pass_fibers)) & ~pass_axon
 
     _blend(no_axon, [220, 50, 50])
+    _blend(multicore_mask, [210, 50, 85])  # crimson-red (distinct from plain red)
     _blend(rej_myel, [200, 120, 30], alpha=0.35)
     _blend(rej_axon, [255, 140, 0])
     _blend(pass_myel, [50, 50, 240])
@@ -218,17 +228,15 @@ def make_overlay(
     font_leg = load_font(13)
 
     # Rejection badges: dark pill with orange border + yellow text
+    PAD = 4
     if len(df_rej) and "reject_reason" in df_rej.columns:
-        PAD = 4
         for _, row in df_rej.iterrows():
             reason = str(row.get("reject_reason", ""))
             if not reason:
                 continue
             x, y = int(row["x0"]), int(row["y0"])
             tx, ty = x - 7, y - 8
-            # measure text bounding box
             bb = draw.textbbox((tx, ty), reason, font=font_code)
-            # pill background
             draw.rectangle(
                 [bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD],
                 fill=(25, 15, 0),
@@ -237,10 +245,28 @@ def make_overlay(
             )
             draw.text((tx, ty), reason, fill=(255, 225, 80), font=font_code)
 
+    # Multi-core badges: crimson pill with "MC" label
+    if mc_fibers:
+        from skimage import measure as _measure
+
+        for p in _measure.regionprops(outer_labels):
+            if p.label not in mc_fibers:
+                continue
+            cy, cx = int(p.centroid[0]), int(p.centroid[1])
+            tx, ty = cx - 7, cy - 8
+            bb = draw.textbbox((tx, ty), "MC", font=font_code)
+            draw.rectangle(
+                [bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD],
+                fill=(60, 10, 20),
+                outline=(210, 50, 85),
+                width=1,
+            )
+            draw.text((tx, ty), "MC", fill=(255, 180, 190), font=font_code)
+
     # Legend box
     _, H = pil.width, pil.height
-    lx, ly = 18, H - 210
-    lw, lh = 290, 192
+    lx, ly = 18, H - 255
+    lw, lh = 320, 237
     arr = np.array(pil)
     arr[ly : ly + lh, lx : lx + lw] = np.clip(
         arr[ly : ly + lh, lx : lx + lw].astype(float) * 0.15 + np.array([18, 18, 18]) * 0.85,
@@ -254,15 +280,17 @@ def make_overlay(
     draw.rectangle([lx, ly, lx + lw, ly + lh], outline=(100, 100, 110), width=1)
 
     entries = [
-        ([0, 210, 60], "Axon — QC passed"),
-        ([50, 50, 240], "Myelin — QC passed"),
-        ([255, 140, 0], "Detected — QC rejected"),
-        ([220, 50, 50], "No axon detected"),
+        ([0, 210, 60], "Axone — QC valide"),
+        ([50, 50, 240], "Myéline — QC valide"),
+        ([255, 140, 0], "Détecté — rejeté QC"),
+        ([210, 50, 85], "MC — Multi-cœur (exclu)"),
+        ([220, 50, 50], "Aucun axone trouvé"),
     ]
     codes = [
-        "Rejection codes:",
-        "G = g-ratio    Ø = diameter    sol = solidity",
-        "ecc = eccen.   off = offset    brd = border",
+        "Codes rejet QC :",
+        "G = g-ratio    Ø = diam.    sol = solidité",
+        "ecc = excentr.  off = offset  brd = bord",
+        "lgG = grande fibre + G < 0.4",
     ]
 
     y_cur = ly + 12
@@ -375,6 +403,7 @@ def make_dashboard(
     n_matched: int,
     stem: str,
     out_path,
+    n_multicore: int = 0,
 ) -> None:
     """Save a 2×3 publication-quality morphometry dashboard."""
     with plt.rc_context(_DASH_STYLE):
@@ -465,10 +494,11 @@ def make_dashboard(
 
         # ── metrics table ─────────────────────────────────────────────────
         tbl_rows = [
-            ["Fibers detected", str(n_outer)],
-            ["With axon", str(n_matched)],
-            ["Passed QC", str(len(df))],
-            ["Rejected QC", str(len(df_rej))],
+            ["Fibres détectées", str(n_outer)],
+            ["Multi-cœur (exclu)", str(n_multicore)],
+            ["Avec axone", str(n_matched)],
+            ["QC validé", str(len(df))],
+            ["QC rejeté", str(len(df_rej))],
             ["—", "—"],
             ["AVF", f"{agg.get('avf', 0):.4f}"],
             ["MVF", f"{agg.get('mvf', 0):.4f}"],

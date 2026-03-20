@@ -69,6 +69,8 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     # ── Step 2: Axon detection ────────────────────────────────────────────
     cache_axon = out_dir / f"{stem}_axon_inner.npy"
 
+    cache_multicore = out_dir / f"{stem}_multicore_labels.npy"
+
     if cache_axon.exists():
         print("  [2/2] Axon detection — loading from cache…")
         inner_labels_raw = np.load(str(cache_axon))
@@ -82,18 +84,22 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
                 continue
             minr, minc, maxr, maxc = bbox
             axon_assignments[int(lbl)] = (minr, minc, inner_labels_raw[minr:maxr, minc:maxc] == lbl)
+        multicore_labels = (
+            set(np.load(str(cache_multicore)).tolist()) if cache_multicore.exists() else set()
+        )
     else:
         print("  [2/2] Building axon input image…")
         axon_input = build_axon_input(img, outer_labels)
         io.imsave(str(out_dir / f"{stem}_axon_input.png"), axon_input, check_contrast=False)
 
         print("       detecting axons (global Otsu)…")
-        axon_assignments = find_axons(axon_input, outer_labels)
+        axon_assignments, multicore_labels = find_axons(axon_input, outer_labels)
 
         inner_labels_raw = np.zeros(outer_labels.shape, dtype=outer_labels.dtype)
         for fiber_label, (r0, c0, crop) in axon_assignments.items():
             inner_labels_raw[r0 : r0 + crop.shape[0], c0 : c0 + crop.shape[1]][crop] = fiber_label
         np.save(str(cache_axon), inner_labels_raw)
+        np.save(str(cache_multicore), np.array(sorted(multicore_labels), dtype=np.int32))
 
     # ── Step 3: Morphometrics + QC ────────────────────────────────────────
     print("  Computing morphometrics…")
@@ -108,6 +114,18 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     df_pass, df_rej = apply_qc(df_all)
     print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
 
+    # Recompute aggregate stats from QC-passed fibers only
+    total_um2 = outer_labels.shape[0] * outer_labels.shape[1] * config.PIXEL_SIZE**2
+    if len(df_pass) and total_um2:
+        agg = {
+            "avf": df_pass["axon_area"].sum() / total_um2,
+            "mvf": (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / total_um2,
+            "gratio_aggr": df_pass["gratio"].mean(),
+            "axon_density_mm2": len(df_pass) / (total_um2 * 1e-6),
+        }
+    else:
+        agg = {"avf": 0.0, "mvf": 0.0, "gratio_aggr": 0.0, "axon_density_mm2": 0.0}
+
     # ── Step 4: Save data ─────────────────────────────────────────────────
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
     df_pass[pub_cols].to_csv(out_dir / f"{stem}_morphometrics.csv", index=False)
@@ -119,7 +137,7 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
 
     # ── Step 5: Visualizations ────────────────────────────────────────────
     print("  Generating visualizations…")
-    overlay = make_overlay(img, outer_labels, inner_labels, df_pass, df_rej)
+    overlay = make_overlay(img, outer_labels, inner_labels, df_pass, df_rej, multicore_labels)
     io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
 
     numbered = make_numbered(overlay, df_pass, n_outer, stem)
@@ -127,7 +145,14 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
 
     make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")
     make_dashboard(
-        df_pass, df_rej, agg, n_outer, n_matched, stem, out_dir / f"{stem}_dashboard.png"
+        df_pass,
+        df_rej,
+        agg,
+        n_outer,
+        n_matched,
+        stem,
+        out_dir / f"{stem}_dashboard.png",
+        n_multicore=len(multicore_labels),
     )
 
     print(f"  ✓ Done — {out_dir}")
@@ -139,9 +164,12 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
 
 def main() -> None:
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    images = sorted(
-        p for p in config.INPUT_DIR.iterdir() if p.suffix.lower() in (".tif", ".tiff", ".png")
-    )
+    if len(sys.argv) > 1:
+        images = [Path(p) for p in sys.argv[1:]]
+    else:
+        images = sorted(
+            p for p in config.INPUT_DIR.iterdir() if p.suffix.lower() in (".tif", ".tiff", ".png")
+        )
     if not images:
         sys.exit(f"No images found in {config.INPUT_DIR}")
 
