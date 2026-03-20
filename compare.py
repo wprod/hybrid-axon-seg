@@ -353,12 +353,24 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("csvs", nargs="+", help="Paths to *_morphometrics.csv files")
+    parser.add_argument(
+        "csvs",
+        nargs="*",
+        help="Paths to *_morphometrics.csv files (default: auto-discover under output/)",
+    )
     parser.add_argument("--labels", nargs="+", help="Label per CSV (default: filename stem)")
     parser.add_argument("--out", default="output/comparison", help="Output directory")
     args = parser.parse_args()
 
-    csvs = [pathlib.Path(p) for p in args.csvs]
+    if args.csvs:
+        csvs = [pathlib.Path(p) for p in args.csvs]
+    else:
+        csvs = sorted(pathlib.Path("output").glob("**/*_morphometrics.csv"))
+        if not csvs:
+            print("No *_morphometrics.csv found under output/", file=sys.stderr)
+            sys.exit(1)
+        print(f"Auto-discovered {len(csvs)} CSV(s) under output/")
+
     labels = args.labels or [p.stem.replace("_morphometrics", "") for p in csvs]
 
     if len(labels) != len(csvs):
