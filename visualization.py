@@ -290,7 +290,7 @@ def make_overlay(
         "Codes rejet QC :",
         "G = g-ratio    Ø = diam.    sol = solidité",
         "ecc = excentr.  off = offset  brd = bord",
-        "lgG = grande fibre + G < 0.4",
+        "lgG = grande fibre (P85+) + G < 0.5",
     ]
 
     y_cur = ly + 12
@@ -502,6 +502,7 @@ def make_dashboard(
             ["—", "—"],
             ["AVF", f"{agg.get('avf', 0):.4f}"],
             ["MVF", f"{agg.get('mvf', 0):.4f}"],
+            ["N-ratio (fibres/total)", f"{agg.get('nratio', 0):.4f}"],
             ["Aggr. G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
             ["Density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
             ["Mean axon diam", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],

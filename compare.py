@@ -301,13 +301,14 @@ def make_comparison_dashboard(groups, labels, out_path):
     print(f"  → {out_path}")
 
 
-def make_comparison_summary(groups, labels, out_path):
+def make_comparison_summary(groups, labels, out_path, nratios=None):
     rows = []
     for df, label in zip(groups, labels, strict=False):
         rows.append(
             {
                 "group": label,
                 "n": len(df),
+                "nratio": (nratios or {}).get(label, float("nan")),
                 "axon_diam_mean": df["axon_diam"].mean(),
                 "axon_diam_std": df["axon_diam"].std(),
                 "gratio_mean": df["gratio"].mean(),
@@ -382,16 +383,24 @@ def main():
 
     print(f"\nLoading {len(csvs)} sample(s):")
     groups = []
+    nratios = {}  # label → nratio from aggregate CSV
     for csv, label in zip(csvs, labels, strict=False):
         df = pd.read_csv(csv)
         print(f"  [{label}]  {len(df)} fibers  ←  {csv}")
         groups.append(df)
+        agg_csv = pathlib.Path(str(csv).replace("_morphometrics.csv", "_aggregate.csv"))
+        if agg_csv.exists():
+            agg = pd.read_csv(agg_csv)
+            if "nratio" in agg.columns:
+                nratios[label] = float(agg["nratio"].iloc[0])
 
     print("\nGenerating comparison dashboard...")
     make_comparison_dashboard(groups, labels, out_dir / "comparison_dashboard.png")
 
     print("Generating summary CSV...")
-    summary = make_comparison_summary(groups, labels, out_dir / "comparison_summary.csv")
+    summary = make_comparison_summary(
+        groups, labels, out_dir / "comparison_summary.csv", nratios=nratios
+    )
 
     print("\n── Summary ─────────────────────────────────────────────────────")
     print(summary.to_string(index=False, float_format="%.3f"))

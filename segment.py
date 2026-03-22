@@ -63,6 +63,17 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
         outer_labels = run_cellpose_fibers(img)
         np.save(str(out_dir / f"{stem}_cellpose_outer.npy"), outer_labels)
 
+    # Erode each fiber mask: remove pixels within OUTER_ERODE_PX of any border
+    # (internal between cells OR external). Vectorized via distance transform.
+    if config.OUTER_ERODE_PX > 0:
+        from scipy.ndimage import distance_transform_edt, maximum_filter, minimum_filter
+
+        nz_max = maximum_filter(outer_labels, size=3)
+        nz_min = minimum_filter(outer_labels, size=3)
+        border = (outer_labels != 0) & (nz_max != nz_min)
+        dist = distance_transform_edt(~border)
+        outer_labels = (outer_labels * (dist > config.OUTER_ERODE_PX)).astype(outer_labels.dtype)
+
     n_outer = int(outer_labels.max())
     print(f"       → {n_outer} fibers")
 
@@ -117,14 +128,17 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     # Recompute aggregate stats from QC-passed fibers only
     total_um2 = outer_labels.shape[0] * outer_labels.shape[1] * config.PIXEL_SIZE**2
     if len(df_pass) and total_um2:
+        avf = df_pass["axon_area"].sum() / total_um2
+        mvf = (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / total_um2
         agg = {
-            "avf": df_pass["axon_area"].sum() / total_um2,
-            "mvf": (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / total_um2,
+            "avf": avf,
+            "mvf": mvf,
+            "nratio": avf + mvf,  # N-ratio = aire fibres / aire totale
             "gratio_aggr": df_pass["gratio"].mean(),
             "axon_density_mm2": len(df_pass) / (total_um2 * 1e-6),
         }
     else:
-        agg = {"avf": 0.0, "mvf": 0.0, "gratio_aggr": 0.0, "axon_density_mm2": 0.0}
+        agg = {"avf": 0.0, "mvf": 0.0, "nratio": 0.0, "gratio_aggr": 0.0, "axon_density_mm2": 0.0}
 
     # ── Step 4: Save data ─────────────────────────────────────────────────
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
