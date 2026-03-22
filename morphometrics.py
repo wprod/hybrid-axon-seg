@@ -71,6 +71,10 @@ def process_fibers(
         best_region = max(axon_rprops, key=lambda r: r.area) if axon_rprops else None
         solidity = best_region.solidity if best_region else 1.0
         eccentricity = best_region.eccentricity if best_region else 0.0
+        fiber_solidity = float(fp.solidity)
+        shape_discordance = float(
+            fiber_solidity - solidity
+        )  # high = fiber round but axon irregular
 
         minr, minc, maxr, maxc = fp.bbox
         border = minr == 0 or minc == 0 or maxr == img_h or maxc == img_w
@@ -90,6 +94,8 @@ def process_fibers(
                 "fiber_area": area_outer * pixel_size**2,
                 "solidity": solidity,
                 "eccentricity": eccentricity,
+                "fiber_solidity": fiber_solidity,
+                "shape_discordance": shape_discordance,
                 "centroid_offset": centroid_offset,
                 "x0": x0,
                 "y0": y0,

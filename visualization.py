@@ -150,24 +150,30 @@ def _styled_table(ax, rows, n_pass, n_rej):
             cell.set_height(0.072)
 
     # Colour-code a few key cells
+    _GREEN = {"— dont valides"}
+    _RED = {"— dont rejetées QC"}
+    _PURPLE = {"— dont multi-cœur"}
+    _BLUE = {
+        "G-ratio agrégé",
+        "AVF  (fraction axonale)",
+        "MVF  (fraction myéline)",
+        "N-ratio  (fibres / total)",
+    }
     key_rows = {
         r: rows[r - 1]
         for r in range(1, n_rows + 1)
-        if rows[r - 1][0]
-        in ("QC validé", "QC rejeté", "Multi-cœur (exclu)", "Aggr. G-ratio", "AVF", "MVF")
+        if rows[r - 1][0] in (_GREEN | _RED | _PURPLE | _BLUE)
     }
     for r, (label, value) in key_rows.items():
         val_cell = tbl[r, 1]
-        if label == "QC validé":
+        if label in _GREEN:
             val_cell.set_facecolor("#D5F5E3")
-        elif label == "QC rejeté":
+        elif label in _RED:
             val_cell.set_facecolor("#FADBD8")
-        elif label == "Multi-cœur (exclu)":
+        elif label in _PURPLE:
             val_cell.set_facecolor("#E8DAEF")
-        elif label in ("Aggr. G-ratio", "AVF", "MVF"):
+        elif label in _BLUE:
             val_cell.set_facecolor("#D6EAF8")
-
-    ax.set_title("QC & Aggregate Metrics", pad=10)
 
 
 # ── Overlay ───────────────────────────────────────────────────────────────────
@@ -265,8 +271,8 @@ def make_overlay(
 
     # Legend box
     _, H = pil.width, pil.height
-    lx, ly = 18, H - 255
-    lw, lh = 320, 237
+    lx, ly = 18, H - 272
+    lw, lh = 320, 254
     arr = np.array(pil)
     arr[ly : ly + lh, lx : lx + lw] = np.clip(
         arr[ly : ly + lh, lx : lx + lw].astype(float) * 0.15 + np.array([18, 18, 18]) * 0.85,
@@ -291,6 +297,7 @@ def make_overlay(
         "G = g-ratio    Ø = diam.    sol = solidité",
         "ecc = excentr.  off = offset  brd = bord",
         "lgG = grande fibre (P85+) + G < 0.5",
+        "shp = forme axone ≠ forme fibre",
     ]
 
     y_cur = ly + 12
@@ -492,43 +499,87 @@ def make_dashboard(
                 title="Myelin thickness vs. Axon diameter",
             )
 
-        # ── metrics table ─────────────────────────────────────────────────
-        tbl_rows = [
-            ["Fibres détectées", str(n_outer)],
-            ["Multi-cœur (exclu)", str(n_multicore)],
-            ["Avec axone", str(n_matched)],
-            ["QC validé", str(len(df))],
-            ["QC rejeté", str(len(df_rej))],
-            ["—", "—"],
-            ["AVF", f"{agg.get('avf', 0):.4f}"],
-            ["MVF", f"{agg.get('mvf', 0):.4f}"],
-            ["N-ratio (fibres/total)", f"{agg.get('nratio', 0):.4f}"],
-            ["Aggr. G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
-            ["Density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
-            ["Mean axon diam", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
-            ["Mean fiber diam", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
-            ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
-        ]
-        _styled_table(axes[1][2], tbl_rows, len(df), len(df_rej))
+        # ── right panel: rejection breakdown + metrics table ──────────────
+        ax_right = axes[1][2]
+        ax_right.axis("off")
+        ax_right.set_title(
+            "Qualité de la segmentation", pad=8, fontsize=11, fontweight="bold", color=_CLR["text"]
+        )
 
-        # ── QC pass/reject mini-bar in table panel top ────────────────────
-        total = len(df) + len(df_rej)
-        if total > 0:
-            inset = axes[1][2].inset_axes([0.0, 0.90, 1.0, 0.08])
-            inset.barh(0, len(df) / total, color="#27AE60", height=0.6)
-            inset.barh(0, len(df_rej) / total, color="#E74C3C", height=0.6, left=len(df) / total)
-            inset.set_xlim(0, 1)
-            inset.axis("off")
-            pct = len(df) / total * 100
-            inset.text(
-                0.01,
-                0,
-                f"  {pct:.0f}% pass",
+        # Rejection breakdown data
+        n_no_axon = n_outer - n_matched - n_multicore
+        reason_counts = (
+            df_rej["reject_reason"].value_counts().to_dict()
+            if len(df_rej) and "reject_reason" in df_rej.columns
+            else {}
+        )
+        _REASON_DESC = {
+            "G": "G — G-ratio hors limites [0.3–0.9]",
+            "shp": "shp — Forme axone ≠ forme fibre",
+            "lgG": "lgG — Grande fibre + G-ratio trop bas",
+            "off": "off — Axone trop décentré",
+            "brd": "brd — Touche le bord de l'image",
+            "sol": "sol — Solidité axone trop faible",
+            "Ø": "Ø  — Axone trop petit",
+            "ecc": "ecc — Axone trop allongé",
+        }
+        _REASON_CLR = {
+            "G": "#E67E22",
+            "shp": "#FF8C00",
+            "lgG": "#F4D03F",
+            "off": "#3498DB",
+            "brd": "#95A5A6",
+            "sol": "#9B59B6",
+            "Ø": "#1ABC9C",
+            "ecc": "#E91E63",
+        }
+        breakdown = [("✓  Valides — axone conforme", len(df), "#27AE60")]
+        for code, desc in _REASON_DESC.items():
+            if code in reason_counts:
+                breakdown.append((desc, reason_counts[code], _REASON_CLR[code]))
+        if n_multicore:
+            breakdown.append(("MC — Multi-cœur (2+ centres détectés)", n_multicore, "#D2355A"))
+        if n_no_axon > 0:
+            breakdown.append(("∅  Aucun axone détecté", n_no_axon, "#E74C3C"))
+
+        # Draw horizontal bars
+        inset_bd = ax_right.inset_axes([0.0, 0.52, 1.0, 0.46])
+        inset_bd.axis("off")
+        total_all = max(sum(v for _, v, _ in breakdown), 1)
+        for i, (label, count, color) in enumerate(reversed(breakdown)):
+            inset_bd.barh(i, count / total_all, color=color, height=0.65, alpha=0.88)
+            inset_bd.text(
+                count / total_all + 0.01,
+                i,
+                f"{count}",
                 va="center",
                 fontsize=7.5,
-                color="white",
+                color=_CLR["text"],
                 weight="bold",
             )
+            inset_bd.text(-0.01, i, label, va="center", ha="right", fontsize=7, color=_CLR["text"])
+        inset_bd.set_xlim(-0.55, 1.18)
+        inset_bd.set_ylim(-0.6, len(breakdown) - 0.4)
+
+        # Metrics table (bottom half)
+        tbl_rows = [
+            ["Fibres Cellpose", str(n_outer)],
+            ["— dont valides", str(len(df))],
+            ["— dont rejetées QC", str(len(df_rej))],
+            ["— dont multi-cœur", str(n_multicore)],
+            ["— dont sans axone", str(n_no_axon)],
+            ["—", "—"],
+            ["AVF  (fraction axonale)", f"{agg.get('avf', 0):.4f}"],
+            ["MVF  (fraction myéline)", f"{agg.get('mvf', 0):.4f}"],
+            ["N-ratio  (fibres / total)", f"{agg.get('nratio', 0):.4f}"],
+            ["G-ratio agrégé", f"{agg.get('gratio_aggr', 0):.4f}"],
+            ["Densité axonale (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
+            ["Diamètre axone moyen", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["Diamètre fibre moyen", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["G-ratio moyen", f"{df['gratio'].mean():.3f}" if has_g else "—"],
+        ]
+        inset_tbl = ax_right.inset_axes([0.0, 0.0, 1.0, 0.50])
+        _styled_table(inset_tbl, tbl_rows, len(df), len(df_rej))
 
         fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)

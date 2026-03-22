@@ -102,11 +102,19 @@ def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> tuple[dict, 
                 >= 0.5
             ) & p.image
 
-        # Expand axon mask to compensate for Otsu under-segmentation at axon/myelin boundary
+        # Expand axon mask to compensate for Otsu under-segmentation at axon/myelin boundary.
+        # Dilation is adaptive: small fibers (L, ~18 px radius) receive the full correction
+        # because the fixed-pixel Otsu error represents a larger fraction of their radius.
+        # Large fibers (R, ~39 px radius) receive a reduced correction.
+        # Threshold: 25 px radius ≈ 4.5 µm diameter @ 0.09 µm/px.
         if config.AXON_DILATE_PX > 0:
-            best = (
-                morphology.binary_dilation(best, morphology.disk(config.AXON_DILATE_PX)) & p.image
+            fiber_radius_px = float(np.sqrt(p.area / np.pi))
+            dil_px = (
+                config.AXON_DILATE_PX
+                if fiber_radius_px < 25
+                else max(1, config.AXON_DILATE_PX // 2)
             )
+            best = morphology.binary_dilation(best, morphology.disk(dil_px)) & p.image
 
         if best.sum() < config.MIN_AXON_SIZE:
             continue

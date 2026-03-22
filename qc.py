@@ -24,6 +24,7 @@ _REASON_LABEL: dict[str, str] = {
     "offset": "off",
     "border": "brd",
     "large_lowG": "lgG",  # large fiber + g-ratio < LARGE_FIBER_MIN_GRATIO
+    "shape": "shp",  # fiber round but axon irregular (shape_discordance > threshold)
 }
 
 
@@ -48,6 +49,8 @@ def apply_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         filters["offset"] = df["centroid_offset"] > config.MAX_CENTROID_OFFSET
     if config.EXCLUDE_BORDER and "image_border_touching" in df.columns:
         filters["border"] = df["image_border_touching"].fillna(False).astype(bool)
+    if "shape_discordance" in df.columns:
+        filters["shape"] = df["shape_discordance"] > config.MAX_SHAPE_DISCORDANCE
     if "fiber_diam" in df.columns and "gratio" in df.columns:
         size_thresh = df["fiber_diam"].quantile(config.LARGE_FIBER_PERCENTILE / 100)
         filters["large_lowG"] = (df["fiber_diam"] >= size_thresh) & (
