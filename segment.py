@@ -32,6 +32,33 @@ from visualization import make_dashboard, make_gratio_map, make_numbered, make_o
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+def _keep_main_cluster(outer_labels: np.ndarray, dilation_px: int) -> np.ndarray:
+    """Zero out all fibers not belonging to the largest spatial cluster.
+
+    Dilates the union of all fiber masks to merge nearby fibers into groups,
+    then discards every fiber whose centroid falls outside the largest component.
+    """
+    from skimage import morphology as morph
+
+    fiber_mask = outer_labels > 0
+    merged = morph.binary_dilation(fiber_mask, morph.disk(dilation_px))
+    cluster_map = measure.label(merged)
+
+    props = measure.regionprops(cluster_map)
+    if not props:
+        return outer_labels
+    main_label = max(props, key=lambda p: p.area).label
+    keep = cluster_map == main_label
+
+    # Zero out any fiber whose centroid is outside the main cluster
+    cleaned = outer_labels.copy()
+    for p in measure.regionprops(outer_labels):
+        cy, cx = int(p.centroid[0]), int(p.centroid[1])
+        if not keep[cy, cx]:
+            cleaned[outer_labels == p.label] = 0
+    return cleaned
+
+
 # ── Single-image pipeline ────────────────────────────────────────────────────
 
 
@@ -73,6 +100,9 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
         border = (outer_labels != 0) & (nz_max != nz_min)
         dist = distance_transform_edt(~border)
         outer_labels = (outer_labels * (dist > config.OUTER_ERODE_PX)).astype(outer_labels.dtype)
+
+    if config.MAIN_CLUSTER_DILATION_PX > 0:
+        outer_labels = _keep_main_cluster(outer_labels, config.MAIN_CLUSTER_DILATION_PX)
 
     n_outer = int(outer_labels.max())
     print(f"       → {n_outer} fibers")
@@ -126,19 +156,34 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
 
     # Recompute aggregate stats from QC-passed fibers only
-    total_um2 = outer_labels.shape[0] * outer_labels.shape[1] * config.PIXEL_SIZE**2
-    if len(df_pass) and total_um2:
-        avf = df_pass["axon_area"].sum() / total_um2
-        mvf = (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / total_um2
+    # Use fascicle area (morphologically closed fiber mask) as denominator
+    from scipy.ndimage import binary_fill_holes as _fill_holes
+    from scipy.ndimage import gaussian_filter as _gauss
+    from skimage import morphology as _morph
+
+    _closed = _fill_holes(_morph.binary_closing(outer_labels > 0, _morph.disk(30)))
+    fascicle_mask = _gauss(_closed.astype(np.float32), sigma=40) > 0.35
+    nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
+    if len(df_pass) and nerve_um2:
+        avf = df_pass["axon_area"].sum() / nerve_um2
+        mvf = (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / nerve_um2
         agg = {
             "avf": avf,
             "mvf": mvf,
-            "nratio": avf + mvf,  # N-ratio = aire fibres / aire totale
+            "nratio": avf + mvf,
             "gratio_aggr": df_pass["gratio"].mean(),
-            "axon_density_mm2": len(df_pass) / (total_um2 * 1e-6),
+            "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
+            "nerve_area_mm2": nerve_um2 * 1e-6,
         }
     else:
-        agg = {"avf": 0.0, "mvf": 0.0, "nratio": 0.0, "gratio_aggr": 0.0, "axon_density_mm2": 0.0}
+        agg = {
+            "avf": 0.0,
+            "mvf": 0.0,
+            "nratio": 0.0,
+            "gratio_aggr": 0.0,
+            "axon_density_mm2": 0.0,
+            "nerve_area_mm2": 0.0,
+        }
 
     # ── Step 4: Save data ─────────────────────────────────────────────────
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
@@ -154,7 +199,9 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     overlay = make_overlay(img, outer_labels, inner_labels, df_pass, df_rej, multicore_labels)
     io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
 
-    numbered = make_numbered(overlay, df_pass, n_outer, stem)
+    numbered = make_numbered(
+        overlay, df_pass, n_outer, stem, nerve_area_mm2=agg.get("nerve_area_mm2", 0.0)
+    )
     io.imsave(str(out_dir / f"{stem}_numbered.png"), numbered, check_contrast=False)
 
     make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")

@@ -43,6 +43,29 @@ _CLR = {
     "header": "#2C3E50",
 }
 
+# Rejection reason → RGB colour (0-255) used in overlay + rejection map
+_REJ_COLORS = {
+    "G": (255, 140, 0),  # orange        — g-ratio
+    "lgG": (255, 70, 30),  # red-orange    — large fiber low g-ratio
+    "shp": (220, 200, 0),  # amber         — shape mismatch
+    "sol": (180, 60, 210),  # purple        — low solidity
+    "off": (30, 170, 230),  # sky blue      — axon off-center
+    "ecc": (240, 60, 140),  # pink          — eccentricity
+    "Ø": (20, 200, 160),  # teal          — too small
+    "brd": (160, 160, 160),  # grey          — touches border
+}
+
+_REJ_LABELS = {
+    "G": "G — G-ratio out of range",
+    "lgG": "lgG — Large fiber + low G-ratio",
+    "shp": "shp — Axon shape ≠ fiber shape",
+    "sol": "sol — Low solidity",
+    "off": "off — Axon off-center",
+    "ecc": "ecc — Axon too elongated",
+    "Ø": "Ø — Axon too small",
+    "brd": "brd — Touches border",
+}
+
 _DASH_STYLE = {
     "figure.facecolor": _CLR["bg"],
     "axes.facecolor": "#FFFFFF",
@@ -150,14 +173,14 @@ def _styled_table(ax, rows, n_pass, n_rej):
             cell.set_height(0.072)
 
     # Colour-code a few key cells
-    _GREEN = {"— dont valides"}
-    _RED = {"— dont rejetées QC"}
-    _PURPLE = {"— dont multi-cœur"}
+    _GREEN = {"— valid"}
+    _RED = {"— QC rejected"}
+    _PURPLE = {"— multi-core"}
     _BLUE = {
-        "G-ratio agrégé",
-        "AVF  (fraction axonale)",
-        "MVF  (fraction myéline)",
-        "N-ratio  (fibres / total)",
+        "Aggregate G-ratio",
+        "AVF  (axon volume fraction)",
+        "MVF  (myelin volume fraction)",
+        "N-ratio  (fibers / total)",
     }
     key_rows = {
         r: rows[r - 1]
@@ -203,6 +226,28 @@ def make_overlay(
             255,
         ).astype(np.uint8)
 
+    # ── Fascicle boundary — striped overlay drawn first (behind everything) ──
+    from scipy.ndimage import binary_fill_holes, gaussian_filter, uniform_filter
+    from skimage import measure as _measure
+
+    gray = rgb[:, :, 0].astype(np.float32)
+    local_mean = uniform_filter(gray, size=15)
+    local_sq_mean = uniform_filter(gray**2, size=15)
+    local_std = np.sqrt(np.clip(local_sq_mean - local_mean**2, 0, None))
+    tissue_mask = local_std > 4.0
+    closed = binary_fill_holes(morphology.binary_closing(tissue_mask, morphology.disk(60)))
+    labeled_cc = _measure.label(closed)
+    if labeled_cc.max() > 1:
+        sizes = np.bincount(labeled_cc.ravel())
+        sizes[0] = 0
+        threshold = sizes.max() * 0.01
+        closed = np.isin(labeled_cc, np.where(sizes >= threshold)[0])
+    fascicle_mask = gaussian_filter(closed.astype(np.float32), sigma=60) > 0.45
+
+    # 2px semi-transparent white perimeter
+    fascicle_boundary = find_boundaries(fascicle_mask, mode="outer")
+    _blend(fascicle_boundary, [255, 255, 255], alpha=0.5)
+
     # Fibers with no axon: split by reason
     multicore_mask = np.isin(outer_labels, list(mc_fibers)) & (inner_labels == 0)
     no_axon = (outer_labels > 0) & (inner_labels == 0) & ~multicore_mask
@@ -213,19 +258,50 @@ def make_overlay(
 
     _blend(no_axon, [220, 50, 50])
     _blend(multicore_mask, [210, 50, 85])  # crimson-red (distinct from plain red)
-    _blend(rej_myel, [200, 120, 30], alpha=0.35)
-    _blend(rej_axon, [255, 140, 0])
+
+    # Rejected fibers: color per QC rejection reason
+    if len(df_rej) and "reject_reason" in df_rej.columns and "_fiber_label" in df_rej.columns:
+        for reason, sub in df_rej.groupby("reject_reason"):
+            clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
+            lbls = set(sub["_fiber_label"].tolist())
+            m_axon = np.isin(inner_labels, list(lbls)) & (inner_labels > 0)
+            m_myel = np.isin(outer_labels, list(lbls)) & ~m_axon & (inner_labels == 0)
+            _blend(m_axon, clr)
+            _blend(m_myel, clr, alpha=0.35)
+    else:
+        _blend(rej_myel, [200, 120, 30], alpha=0.35)
+        _blend(rej_axon, [255, 140, 0])
+
     _blend(pass_myel, [50, 50, 240])
     _blend(pass_axon, [0, 210, 60])
 
     outer_c = morphology.binary_dilation(
         find_boundaries(outer_labels, mode="thick"), morphology.disk(1)
     )
-    inner_c = morphology.binary_dilation(
-        find_boundaries(inner_labels, mode="thick"), morphology.disk(1)
-    )
+    inner_c_thin = find_boundaries(inner_labels, mode="thick")
+
     overlay[outer_c] = [70, 70, 220]
-    overlay[inner_c] = [0, 240, 80]
+
+    # Green contour only for passed axons
+    pass_c = morphology.binary_dilation(
+        inner_c_thin & np.isin(inner_labels, list(pass_fibers)), morphology.disk(1)
+    )
+    overlay[pass_c] = [0, 240, 80]
+
+    # Rejected axon contours: per-reason color
+    if len(df_rej) and "reject_reason" in df_rej.columns and "_fiber_label" in df_rej.columns:
+        for reason, sub in df_rej.groupby("reject_reason"):
+            lbls = set(sub["_fiber_label"].tolist())
+            clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
+            rej_c = morphology.binary_dilation(
+                inner_c_thin & np.isin(inner_labels, list(lbls)), morphology.disk(1)
+            )
+            overlay[rej_c] = clr
+    else:
+        rej_c = morphology.binary_dilation(
+            inner_c_thin & np.isin(inner_labels, list(rej_fibers)), morphology.disk(1)
+        )
+        overlay[rej_c] = [255, 140, 0]
 
     # ── PIL layer ─────────────────────────────────────────────────────────
     pil = Image.fromarray(overlay)
@@ -269,10 +345,40 @@ def make_overlay(
             )
             draw.text((tx, ty), "MC", fill=(255, 180, 190), font=font_code)
 
-    # Legend box
+    # ── Legend (dynamic: one entry per rejection reason present) ──────────
+    present_reasons = (
+        sorted(df_rej["reject_reason"].dropna().unique())
+        if len(df_rej) and "reject_reason" in df_rej.columns
+        else []
+    )
+    entries = [
+        ([0, 210, 60], "Axon — QC passed"),
+        ([50, 50, 240], "Myelin — QC passed"),
+    ]
+    for reason in present_reasons:
+        clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
+        entries.append((clr, _REJ_LABELS.get(reason, f"Rejected: {reason}")))
+    if not present_reasons:
+        entries.append(([255, 140, 0], "Detected — QC rejected"))
+    entries.append(([210, 50, 85], "MC — Multi-core (excluded)"))
+    entries.append(([220, 50, 50], "No axon found"))
+
+    codes = [
+        "QC rejection codes:",
+        "G = g-ratio    Ø = diam.    sol = solidity",
+        "ecc = eccentr.  off = offset  brd = border",
+        "lgG = large fiber (P85+) + G < 0.5",
+        "shp = axon shape ≠ fiber shape",
+    ]
+
+    ENTRY_H = 24
+    CODE_H = 16
+    lx = 18
+    lw = 325
+    lh = 12 + len(entries) * ENTRY_H + 10 + len(codes) * CODE_H + 8
     _, H = pil.width, pil.height
-    lx, ly = 18, H - 272
-    lw, lh = 320, 254
+    ly = H - lh - 10
+
     arr = np.array(pil)
     arr[ly : ly + lh, lx : lx + lw] = np.clip(
         arr[ly : ly + lh, lx : lx + lw].astype(float) * 0.15 + np.array([18, 18, 18]) * 0.85,
@@ -282,33 +388,15 @@ def make_overlay(
     pil = Image.fromarray(arr)
     draw = ImageDraw.Draw(pil)
 
-    # rounded border
     draw.rectangle([lx, ly, lx + lw, ly + lh], outline=(100, 100, 110), width=1)
-
-    entries = [
-        ([0, 210, 60], "Axone — QC valide"),
-        ([50, 50, 240], "Myéline — QC valide"),
-        ([255, 140, 0], "Détecté — rejeté QC"),
-        ([210, 50, 85], "MC — Multi-cœur (exclu)"),
-        ([220, 50, 50], "Aucun axone trouvé"),
-    ]
-    codes = [
-        "Codes rejet QC :",
-        "G = g-ratio    Ø = diam.    sol = solidité",
-        "ecc = excentr.  off = offset  brd = bord",
-        "lgG = grande fibre (P85+) + G < 0.5",
-        "shp = forme axone ≠ forme fibre",
-    ]
 
     y_cur = ly + 12
     for color, label in entries:
-        # circle swatch instead of square
         cx_sw, cy_sw = lx + 18, y_cur + 8
         draw.ellipse([cx_sw - 7, cy_sw - 7, cx_sw + 7, cy_sw + 7], fill=tuple(color))
         draw.text((lx + 34, y_cur), label, fill=(230, 230, 230), font=font_leg)
-        y_cur += 25
+        y_cur += ENTRY_H
 
-    # divider
     draw.line([lx + 10, y_cur, lx + lw - 10, y_cur], fill=(70, 70, 80), width=1)
     y_cur += 8
 
@@ -316,7 +404,7 @@ def make_overlay(
         clr = (210, 210, 220) if i == 0 else (150, 150, 160)
         fnt = load_font(11) if i > 0 else load_font(12)
         draw.text((lx + 12, y_cur), line, fill=clr, font=fnt)
-        y_cur += 17
+        y_cur += CODE_H
 
     return np.array(pil)
 
@@ -329,6 +417,7 @@ def make_numbered(
     df: pd.DataFrame,
     n_outer: int,
     stem: str,
+    nerve_area_mm2: float = 0.0,
 ) -> np.ndarray:
     """Add sequential yellow numbers on QC-passed axons + a stats banner."""
     pil = Image.fromarray(overlay)
@@ -353,10 +442,11 @@ def make_numbered(
     canvas = Image.new("RGB", (pil.width, pil.height + banner_h), (22, 28, 36))
     canvas.paste(pil, (0, banner_h))
     d = ImageDraw.Draw(canvas)
+    area_str = f"     nerve area = {nerve_area_mm2:.4f} mm²" if nerve_area_mm2 else ""
     d.text(
         (14, 12),
         f"n = {n} / {n_outer}     axon = {mean_ax:.2f} µm"
-        f"     fiber = {mean_fi:.2f} µm     G = {mean_g:.3f}     {stem}",
+        f"     fiber = {mean_fi:.2f} µm     G = {mean_g:.3f}{area_str}     {stem}",
         fill=(220, 220, 230),
         font=font_banner,
     )
@@ -503,7 +593,7 @@ def make_dashboard(
         ax_right = axes[1][2]
         ax_right.axis("off")
         ax_right.set_title(
-            "Qualité de la segmentation", pad=8, fontsize=11, fontweight="bold", color=_CLR["text"]
+            "Segmentation quality", pad=8, fontsize=11, fontweight="bold", color=_CLR["text"]
         )
 
         # Rejection breakdown data
@@ -513,34 +603,15 @@ def make_dashboard(
             if len(df_rej) and "reject_reason" in df_rej.columns
             else {}
         )
-        _REASON_DESC = {
-            "G": "G — G-ratio hors limites [0.3–0.9]",
-            "shp": "shp — Forme axone ≠ forme fibre",
-            "lgG": "lgG — Grande fibre + G-ratio trop bas",
-            "off": "off — Axone trop décentré",
-            "brd": "brd — Touche le bord de l'image",
-            "sol": "sol — Solidité axone trop faible",
-            "Ø": "Ø  — Axone trop petit",
-            "ecc": "ecc — Axone trop allongé",
-        }
-        _REASON_CLR = {
-            "G": "#E67E22",
-            "shp": "#FF8C00",
-            "lgG": "#F4D03F",
-            "off": "#3498DB",
-            "brd": "#95A5A6",
-            "sol": "#9B59B6",
-            "Ø": "#1ABC9C",
-            "ecc": "#E91E63",
-        }
-        breakdown = [("✓  Valides — axone conforme", len(df), "#27AE60")]
-        for code, desc in _REASON_DESC.items():
+        breakdown = [("✓  Valid — axon confirmed", len(df), "#27AE60")]
+        for code in _REJ_LABELS:
             if code in reason_counts:
-                breakdown.append((desc, reason_counts[code], _REASON_CLR[code]))
+                clr = tuple(c / 255 for c in _REJ_COLORS.get(code, (255, 140, 0)))
+                breakdown.append((_REJ_LABELS[code], reason_counts[code], clr))
         if n_multicore:
-            breakdown.append(("MC — Multi-cœur (2+ centres détectés)", n_multicore, "#D2355A"))
+            breakdown.append(("MC — Multi-core (2+ cores detected)", n_multicore, "#D2355A"))
         if n_no_axon > 0:
-            breakdown.append(("∅  Aucun axone détecté", n_no_axon, "#E74C3C"))
+            breakdown.append(("∅  No axon detected", n_no_axon, "#E74C3C"))
 
         # Draw horizontal bars
         inset_bd = ax_right.inset_axes([0.0, 0.52, 1.0, 0.46])
@@ -563,20 +634,20 @@ def make_dashboard(
 
         # Metrics table (bottom half)
         tbl_rows = [
-            ["Fibres Cellpose", str(n_outer)],
-            ["— dont valides", str(len(df))],
-            ["— dont rejetées QC", str(len(df_rej))],
-            ["— dont multi-cœur", str(n_multicore)],
-            ["— dont sans axone", str(n_no_axon)],
-            ["—", "—"],
-            ["AVF  (fraction axonale)", f"{agg.get('avf', 0):.4f}"],
-            ["MVF  (fraction myéline)", f"{agg.get('mvf', 0):.4f}"],
-            ["N-ratio  (fibres / total)", f"{agg.get('nratio', 0):.4f}"],
-            ["G-ratio agrégé", f"{agg.get('gratio_aggr', 0):.4f}"],
-            ["Densité axonale (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
-            ["Diamètre axone moyen", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
-            ["Diamètre fibre moyen", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
-            ["G-ratio moyen", f"{df['gratio'].mean():.3f}" if has_g else "—"],
+            ["Cellpose fibers", str(n_outer)],
+            ["— valid", str(len(df))],
+            ["— QC rejected", str(len(df_rej))],
+            ["— multi-core", str(n_multicore)],
+            ["— no axon", str(n_no_axon)],
+            ["Nerve area (mm²)", f"{agg.get('nerve_area_mm2', 0):.4f}"],
+            ["AVF  (axon volume fraction)", f"{agg.get('avf', 0):.4f}"],
+            ["MVF  (myelin volume fraction)", f"{agg.get('mvf', 0):.4f}"],
+            ["N-ratio  (fibers / total)", f"{agg.get('nratio', 0):.4f}"],
+            ["Aggregate G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
+            ["Axon density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
+            ["Mean axon diameter", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["Mean fiber diameter", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
+            ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
         ]
         inset_tbl = ax_right.inset_axes([0.0, 0.0, 1.0, 0.50])
         _styled_table(inset_tbl, tbl_rows, len(df), len(df_rej))

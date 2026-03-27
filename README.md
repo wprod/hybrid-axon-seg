@@ -4,8 +4,8 @@
 
 Detects myelinated axons in cross-sectional nerve images, segments the axon
 and myelin compartments, and computes g-ratio, myelin thickness, axon/fiber
-diameters, axon volume fraction (AVF), myelin volume fraction (MVF), and
-axon density — with full QC overlay output.
+diameters, axon volume fraction (AVF), myelin volume fraction (MVF), N-ratio,
+and axon density — with full QC overlay output.
 
 ---
 
@@ -36,8 +36,8 @@ images where **myelin sheaths appear dark** and **axon interiors appear bright**
 This pipeline automates the full morphometric analysis:
 
 ```
-raw TIFF  →  Cellpose (outer fibers)  →  normalized inversion
-          →  Otsu threshold (axon blobs)  →  morphometrics  →  QC  →  outputs
+edited TIFF  →  Cellpose (outer fibers)  →  normalized inversion
+             →  Otsu threshold (axon blobs)  →  morphometrics  →  QC  →  outputs
 ```
 
 Key design decisions:
@@ -50,22 +50,27 @@ Key design decisions:
 | **Global Otsu on the full `axon_input` image** | All normalized fiber pixels together form a clean bimodal distribution — one threshold for the entire image, no per-fiber fitting |
 | **Crop-based morphometrics** | All per-fiber operations use small bounding-box crops instead of full-image masks, keeping memory and runtime linear in fiber count |
 | **Two-level cache** | Cellpose results and axon detections are cached separately so detection parameters can be tuned without re-running Cellpose (~5 min on GPU) |
+| **Fascicle area denominator** | AVF, MVF, N-ratio and density use the nerve fascicle area (convex Gaussian-smoothed envelope of the fiber mask) rather than total image area |
+
+> **Image preparation:** contrast and brightness must be adjusted manually
+> (with a medical eye) in ImageJ/Fiji before running the pipeline, as optimal
+> settings vary per image and staining batch. Place corrected images in `edited/`.
 
 ---
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies (Python 3.11+)
-pip install cellpose scikit-image scipy numpy pandas pillow matplotlib openpyxl
+# 1. Install dependencies (Python 3.11+, CUDA or MPS recommended for Cellpose)
+pip install -r requirements.txt
 
-# 2. Place your TIFF images in the edited/ directory
+# 2. Place your contrast-adjusted TIFF images in the edited/ directory
 
 # 3. Run the full pipeline on all images
 python segment.py
 
-# 4. Or test on a single image first
-python test_one.py
+# 4. Or process a single image
+python segment.py "edited/MyImage.tif"
 ```
 
 All parameters are in `config.py` — no code changes needed for routine use.
@@ -96,13 +101,17 @@ and overlapping objects, where classical watershed methods fail.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `CP_MODEL` | `cyto3` | Pretrained Cellpose 3 model |
-| `CP_DIAM_UM` | `8.0 µm` | Expected fiber diameter (sets internal rescaling) |
+| `CP_DIAM_UM` | `7.0 µm` | Expected fiber diameter (sets internal rescaling) |
 | `CP_FLOW_THR` | `0.4` | Flow error threshold — lower is more permissive |
 | `CP_CELLPROB` | `0.0` | Cell probability threshold — lower detects more |
 
 The diameter in pixels fed to Cellpose is:
 
 $$d_{px} = \frac{\texttt{CP\_DIAM\_UM}}{\texttt{PIXEL\_SIZE}}$$
+
+**Post-processing:**
+- Each fiber mask is **eroded** by `OUTER_ERODE_PX` pixels (via distance transform) to shrink the fiber boundary and reduce myelin bleed into adjacent regions.
+- **Isolated cluster removal** (`MAIN_CLUSTER_DILATION_PX`): fiber masks are dilated and grouped into connected components; any fiber whose centroid lies outside the largest component (the main nerve fascicle) is discarded. This removes parasitic fiber clusters at image edges.
 
 **Output:** An integer label array where each pixel contains its fiber ID
 (1 to N) or 0 for background. This label map is the **source of truth for
@@ -139,7 +148,8 @@ $$D(x,y) = \min_{(x', y') \notin \text{fiber}} \|(x,y) - (x',y')\|_2$$
 Only pixels with $D(x,y) > \texttt{MASK\_ERODE\_PX}$ form the **clean
 interior** (`inner`). This is geometrically equivalent to morphological
 erosion by `MASK_ERODE_PX` pixels, but the continuous distance values are
-reused in the fade step below.
+reused in the fade step below. Erosion depth is also capped at 25% of the
+fiber equivalent radius to preserve signal in small or thin-myelin fibers.
 
 #### 2b — Per-Fiber Percentile Stretch
 
@@ -228,6 +238,9 @@ This rule is robust because the axon is nearly always centered within its
 fiber. The fallback to "largest component" handles the rare case of a
 de-centered axon.
 
+Fibers with **multiple distinct dark blobs** (potential multicore fibers) are
+flagged and tracked separately — they are excluded from QC pass but recorded.
+
 #### 3c — Hole Filling + Minimum Size Filter
 
 `scipy.ndimage.binary_fill_holes` fills any internal holes in the selected
@@ -297,17 +310,24 @@ where $a$ and $b$ are the semi-major and semi-minor axes of the best-fit
 ellipse. $\varepsilon = 0$ for a perfect circle; $\varepsilon \to 1$ for
 a needle-like shape.
 
-#### Aggregate Metrics
+#### Fascicle Area & Aggregate Metrics
+
+The nerve fascicle area is estimated by:
+1. Morphologically closing the union of all fiber masks (`disk(30)`) to fill inter-fiber gaps.
+2. Filling remaining internal holes (`binary_fill_holes`).
+3. Applying a Gaussian blur (`sigma=40`) and thresholding at 0.35 to produce a smooth, slightly expanded convex envelope.
+
+This fascicle mask is used as the denominator for all volume fractions and density, giving biologically meaningful values independent of image crop size.
 
 | Metric | Formula | Unit |
 |---|---|---|
-| AVF | $\displaystyle\frac{\sum_i A_{\text{axon},i}}{H \cdot W \cdot s^2}$ | fraction |
-| MVF | $\displaystyle\frac{\sum_i \left(A_{\text{fiber},i} - A_{\text{axon},i}\right)}{H \cdot W \cdot s^2}$ | fraction |
+| AVF | $\displaystyle\frac{\sum_i A_{\text{axon},i}}{A_{\text{fascicle}}}$ | fraction |
+| MVF | $\displaystyle\frac{\sum_i \left(A_{\text{fiber},i} - A_{\text{axon},i}\right)}{A_{\text{fascicle}}}$ | fraction |
+| N-ratio | $\text{AVF} + \text{MVF}$ | fraction |
 | Aggregate g-ratio | $\bar{g} = \text{mean}(g_i)$ | — |
-| Axon density | $\displaystyle\frac{N}{H \cdot W \cdot s^2 \cdot 10^{-6}}$ | axons/mm² |
+| Axon density | $\displaystyle\frac{N}{A_{\text{fascicle}} \cdot 10^{-6}}$ | axons/mm² |
 
-where $s = \texttt{PIXEL\_SIZE}$ (µm/px), $H \times W$ is the image size in
-pixels, and $N$ is the number of QC-passed fibers.
+where $A_{\text{fascicle}}$ is in µm².
 
 ---
 
@@ -316,15 +336,16 @@ pixels, and $N$ is the number of QC-passed fibers.
 **File:** `qc.py → apply_qc()`
 
 Each fiber is independently tested against six filters. The **first failing
-filter** determines the rejection code printed on the overlay.
+filter** determines the rejection code shown on the overlay.
 
 | Code | Filter | Default threshold | Biological rationale |
 |---|---|---|---|
-| `G` | G-ratio | $[0.215,\ 0.9]$ | Outside normal myelination range — likely a detection error |
-| `Ø` | Axon diameter | $\geq 0.5\,\mu\text{m}$ | Below optical resolution limit |
-| `sol` | Solidity | $\geq 0.4$ | Non-convex / fragmented blob — likely noise or artefact |
-| `ecc` | Eccentricity | $\leq 0.99$ | Near-linear shape — likely a cross-section artefact |
-| `off` | Centroid offset | $\leq 0.65$ | Severely off-center axon within its fiber |
+| `G` | G-ratio | $[0.3,\ 0.9]$ | Outside normal myelination range |
+| `lgG` | Large-fiber g-ratio | large fibers (≥ p85) with g < 0.5 | Oversized axon in large fiber — likely detection error |
+| `shp` | Shape discordance | fiber_solidity − axon_solidity > 0.2 | Round fiber but irregular axon — likely artefact |
+| `sol` | Solidity | $\geq 0.1$ | Non-convex / fragmented blob |
+| `off` | Centroid offset | $\leq 0.95$ | Severely off-center axon |
+| `Ø` | Axon diameter | $\geq 0.5\,\mu\text{m}$ | Below resolution limit |
 | `brd` | Image border | excluded | Incomplete fiber at image edge |
 
 > **Note:** All thresholds are intentionally permissive — the clinician
@@ -341,17 +362,17 @@ filter** determines the rejection code printed on the overlay.
 
 Full-resolution colour-coded image with every fiber annotated:
 
-- Each QC-passed fiber shows a **green axon** and **blue myelin ring**.
-- Each rejected fiber shows an **orange axon** with the rejection code (`G`,
-  `Ø`, `sol`, `ecc`, `off`, `brd`) printed in yellow at its centroid.
-- Fibers with no detected axon are **red**.
+- Each QC-passed fiber shows a **green axon contour** and **blue myelin ring**.
+- Each rejected fiber is **color-coded by rejection reason** (see color scheme below), with the rejection code printed in yellow at its centroid.
+- Fibers with no detected axon are shaded **red**.
+- A **white contour** outlines the estimated nerve fascicle boundary.
 - A semi-transparent legend box is embedded in the bottom-left corner.
 
 #### Numbered Image (`*_numbered.png`)
 
 Same overlay with sequential **yellow numbers** on each QC-passed axon and
-a top banner displaying: count, mean axon diameter, mean fiber diameter, mean
-g-ratio.
+a top banner displaying: count, nerve area, mean axon diameter, mean fiber
+diameter, mean g-ratio.
 
 #### G-ratio Heatmap (`*_gratio_map.png`)
 
@@ -361,16 +382,8 @@ red = low g-ratio (thin myelin relative to axon), green = high g-ratio
 
 #### Dashboard (`*_dashboard.png`)
 
-Six-panel summary figure:
-
-| Panel | Content |
-|---|---|
-| Top-left | Axon diameter distribution (histogram) |
-| Top-center | G-ratio distribution (histogram) |
-| Top-right | Myelin thickness distribution (histogram) |
-| Bottom-left | G-ratio vs. axon diameter (scatter + reference line at 0.6) |
-| Bottom-center | Myelin thickness vs. axon diameter (scatter) |
-| Bottom-right | QC & aggregate metrics table |
+Summary figure with distributions, scatter plots, and aggregate metrics table
+(AVF, MVF, N-ratio, mean g-ratio, axon density, nerve area, QC counts).
 
 ---
 
@@ -386,11 +399,13 @@ $$t_{\text{myelin}} = \frac{d_{\text{fiber}} - d_{\text{axon}}}{2}$$
 
 $$\delta_{\text{offset}} = \frac{\|\mathbf{c}_{\text{axon}} - \mathbf{c}_{\text{fiber}}\|_2}{\sqrt{A_{\text{fiber}}/\pi}}$$
 
-$$\text{AVF} = \frac{\displaystyle\sum_i A_{\text{axon},i}}{H \cdot W \cdot s^2}$$
+$$\text{AVF} = \frac{\displaystyle\sum_i A_{\text{axon},i}}{A_{\text{fascicle}}}$$
 
-$$\text{MVF} = \frac{\displaystyle\sum_i \bigl(A_{\text{fiber},i} - A_{\text{axon},i}\bigr)}{H \cdot W \cdot s^2}$$
+$$\text{MVF} = \frac{\displaystyle\sum_i \bigl(A_{\text{fiber},i} - A_{\text{axon},i}\bigr)}{A_{\text{fascicle}}}$$
 
-$$\text{density} = \frac{N}{H \cdot W \cdot s^2 \cdot 10^{-6}} \quad [\text{axons/mm}^2]$$
+$$\text{N-ratio} = \text{AVF} + \text{MVF}$$
+
+$$\text{density} = \frac{N}{A_{\text{fascicle}} \cdot 10^{-6}} \quad [\text{axons/mm}^2]$$
 
 $$\text{solidity} = \frac{A_{\text{region}}}{A_{\text{convex hull}}}$$
 
@@ -406,29 +421,40 @@ All parameters live in `config.py`. Edit there — no code changes needed.
 
 ```python
 # I/O
-INPUT_DIR  = Path("edited")   # source TIFF directory
+INPUT_DIR  = Path("edited")   # source TIFF directory (contrast-adjusted images)
 OUTPUT_DIR = Path("output")   # results directory
 PIXEL_SIZE = 0.09             # µm per pixel at acquisition resolution
 
 # Cellpose — pass 1 (outer fibers)
 CP_MODEL    = "cyto3"   # Cellpose model name
-CP_DIAM_UM  = 8.0       # expected fiber diameter (µm)
+CP_DIAM_UM  = 7.0       # expected fiber diameter (µm)
 CP_FLOW_THR = 0.4       # flow error threshold (lower = more permissive)
 CP_CELLPROB = 0.0       # cell probability threshold
 
 # Inversion / preprocessing
-MASK_ERODE_PX = 4   # boundary erosion depth (px)
-FADE_PX       = 8   # inward fade length (px)
-MIN_AXON_SIZE = 40  # minimum axon blob area (px²)
+MASK_ERODE_PX          = 4    # boundary erosion depth (px)
+FADE_PX                = 8    # inward fade length (px)
+MIN_AXON_SIZE          = 40   # minimum axon blob area (px²)
+AXON_SMOOTH_SIGMA      = 1.5  # Gaussian sigma for axon perimeter smoothing (0 = off)
+AXON_DILATE_PX         = 3    # expand axon mask after convex hull (0 = off)
+AXON_MIN_MYELIN_PX     = 2    # minimum myelin ring thickness (px)
+OUTER_ERODE_PX         = 2    # erode fiber mask before morphometrics (px)
+AXON_INPUT_WHITE_POINT = 160  # clip white point of axon_input (255 = off)
 
 # QC filters  (permissive by default — clinician adjusts)
-MIN_GRATIO          = 0.215
-MAX_GRATIO          = 0.9
-MIN_AXON_DIAM_UM    = 0.5
-MIN_SOLIDITY        = 0.4
-MAX_CENTROID_OFFSET = 0.65
-MAX_AXON_ECCEN      = 0.99
-EXCLUDE_BORDER      = True
+MIN_GRATIO             = 0.3
+MAX_GRATIO             = 0.9
+LARGE_FIBER_MIN_GRATIO = 0.5   # g-ratio floor for large fibers
+LARGE_FIBER_PERCENTILE = 85    # "large fiber" = top 15% by fiber area
+MIN_AXON_DIAM_UM       = 0.5
+MIN_SOLIDITY           = 0.1
+MAX_SHAPE_DISCORDANCE  = 0.2   # max (fiber_solidity - axon_solidity)
+MAX_CENTROID_OFFSET    = 0.95
+MAX_AXON_ECCEN         = 1.0   # effectively disabled
+EXCLUDE_BORDER         = True
+
+# Isolated cluster removal
+MAIN_CLUSTER_DILATION_PX = 15  # set to 0 to disable
 ```
 
 **Tuning guide:**
@@ -439,7 +465,8 @@ EXCLUDE_BORDER      = True
 | Cellpose misses small fibers | Decrease `CP_DIAM_UM` or `CP_CELLPROB` |
 | Dark rings visible in `*_axon_input.png` | Increase `MASK_ERODE_PX` |
 | Hard edge visible at fiber boundary | Increase `FADE_PX` |
-| Too many orange fibers | Loosen QC thresholds in `config.py` |
+| Too many rejected fibers | Loosen QC thresholds in `config.py` |
+| Parasitic fiber clusters outside nerve | Increase `MAIN_CLUSTER_DILATION_PX` |
 | Want to re-run axon detection only | Delete `*_axon_inner.npy` |
 | Want to re-run everything | Delete `*_cellpose_outer.npy` |
 
@@ -453,14 +480,15 @@ For each input image `Foo.tif`, results are saved in `output/Foo/`:
 |---|---|
 | `Foo_cellpose_outer.npy` | Cellpose pass-1 label array **(cache)** |
 | `Foo_axon_inner.npy` | Axon detection label array **(cache)** |
+| `Foo_multicore_labels.npy` | Fiber IDs flagged as multicore **(cache)** |
 | `Foo_axon_input.png` | Normalized-inverted debug image (axon=dark, myelin=bright) |
 | `Foo_overlay.png` | Full-resolution colour-coded overlay with legend |
 | `Foo_numbered.png` | Overlay with numbered QC-passed axons + stats banner |
 | `Foo_gratio_map.png` | Per-axon g-ratio heatmap (RdYlGn) |
-| `Foo_dashboard.png` | 6-panel morphometry dashboard |
+| `Foo_dashboard.png` | Morphometry dashboard |
 | `Foo_morphometrics.csv` | Per-axon measurements (QC-passed only) |
 | `Foo_morphometrics.xlsx` | Same as CSV in Excel format |
-| `Foo_aggregate.csv` | Image-level aggregates (AVF, MVF, density, mean g-ratio) |
+| `Foo_aggregate.csv` | Image-level aggregates (AVF, MVF, N-ratio, density, mean g-ratio) |
 
 A global `output/summary.csv` collects aggregate metrics across all images.
 
@@ -494,6 +522,7 @@ hybrid-axon-seg/
 ├── morphometrics.py    # Per-fiber geometry + aggregate metrics
 ├── qc.py               # QC filters with rejection reason tracking
 ├── visualization.py    # Overlay, numbered image, g-ratio map, dashboard
+├── compare.py          # Group comparison dashboard (L vs R, or custom groups)
 └── test_one.py         # Single-image test runner
 ```
 
@@ -503,6 +532,7 @@ hybrid-axon-seg/
 img (TIFF)
   │
   ├── [detection.py]      run_cellpose_fibers()  →  outer_labels
+  │                       _keep_main_cluster()   →  outer_labels (cleaned)
   │
   ├── [preprocessing.py]  build_axon_input()     →  axon_input  →  *_axon_input.png
   │
@@ -526,19 +556,28 @@ img (TIFF)
 
 ## Overlay Color Scheme
 
+**QC-passed fibers:**
 ```
-  █  Green   #00D23C  Axon interior     — passed all QC filters
-  █  Blue    #3232F0  Myelin ring       — passed all QC filters
-  █  Orange  #FF8C00  Axon detected     — failed QC (reason code printed on fiber)
-  █  Red     #DC3232  No axon detected  — Otsu found no dark blob in this fiber
+  █  Green   #00F050  Axon contour      — passed all QC filters
+  █  Blue    #4646DC  Myelin ring       — passed all QC filters
+```
 
-Rejection codes (printed in yellow on each orange fiber):
-  G    g-ratio outside [MIN_GRATIO, MAX_GRATIO]
-  Ø    axon diameter < MIN_AXON_DIAM_UM
-  sol  solidity < MIN_SOLIDITY
-  ecc  eccentricity > MAX_AXON_ECCEN
-  off  centroid offset > MAX_CENTROID_OFFSET
-  brd  fiber touches image border
+**Rejected fibers (color-coded by rejection reason):**
+```
+  █  Orange       #FF8C00  G      g-ratio outside [MIN_GRATIO, MAX_GRATIO]
+  █  Red-orange   #FF461E  lgG    large fiber with g-ratio below floor
+  █  Amber        #DCC800  shp    shape discordance (round fiber, irregular axon)
+  █  Purple       #B43CD2  sol    solidity below threshold
+  █  Sky blue     #1EAAE6  off    centroid offset above threshold
+  █  Pink         #F03C8C  ecc    eccentricity above threshold
+  █  Teal         #14C8A0  Ø      axon diameter below resolution limit
+  █  Grey         #A0A0A0  brd    fiber touches image border
+```
+
+**Other:**
+```
+  █  Red     #DC3232  No axon detected  — Otsu found no dark blob in this fiber
+  ─  White            Fascicle boundary — estimated nerve cross-section envelope
 ```
 
 ---

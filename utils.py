@@ -8,9 +8,10 @@ from PIL import ImageFont
 
 
 def clean_stem(path: Path) -> str:
-    """Strip trailing '(clean).tif[f]' suffix to get a clean output stem."""
+    """Strip trailing '(clean).tif[f]' suffix (and any remaining .tif) to get a clean stem."""
     name = path.name
-    name = re.sub(r"(?:\s*\(clean\))?\.tiff?$", "", name)
+    name = re.sub(r"(?:\s*\(clean\))?\.tiff?$", "", name)  # strip (clean).tif
+    name = re.sub(r"\.tiff?$", "", name)  # strip any remaining .tif
     return name
 
 
