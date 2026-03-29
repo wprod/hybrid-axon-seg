@@ -165,24 +165,32 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     fascicle_mask = _gauss(_closed.astype(np.float32), sigma=40) > 0.35
     nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
     if len(df_pass) and nerve_um2:
-        avf = df_pass["axon_area"].sum() / nerve_um2
-        mvf = (df_pass["fiber_area"].sum() - df_pass["axon_area"].sum()) / nerve_um2
+        total_axon_um2 = df_pass["axon_area"].sum()
+        total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
+        avf = total_axon_um2 / nerve_um2
+        mvf = total_myelin_um2 / nerve_um2
         agg = {
-            "avf": avf,
-            "mvf": mvf,
+            "n_axons": len(df_pass),
+            "nerve_area_mm2": nerve_um2 * 1e-6,
+            "total_axon_area_mm2": total_axon_um2 * 1e-6,
+            "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
             "nratio": avf + mvf,
             "gratio_aggr": df_pass["gratio"].mean(),
+            "avf": avf,
+            "mvf": mvf,
             "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
-            "nerve_area_mm2": nerve_um2 * 1e-6,
         }
     else:
         agg = {
-            "avf": 0.0,
-            "mvf": 0.0,
+            "n_axons": 0,
+            "nerve_area_mm2": 0.0,
+            "total_axon_area_mm2": 0.0,
+            "total_myelin_area_mm2": 0.0,
             "nratio": 0.0,
             "gratio_aggr": 0.0,
+            "avf": 0.0,
+            "mvf": 0.0,
             "axon_density_mm2": 0.0,
-            "nerve_area_mm2": 0.0,
         }
 
     # ── Step 4: Save data ─────────────────────────────────────────────────

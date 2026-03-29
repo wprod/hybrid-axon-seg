@@ -323,12 +323,14 @@ def _plot_summary_table(ax, groups, labels, colors, agg_df, nratios):
 
     col_headers = [
         "Condition",
-        "N images",
-        "N fibers",
+        "N img",
+        "N axons",
+        "nerve mm²",
+        "axon mm²",
+        "myelin mm²",
         "n-ratio",
-        "g-ratio (mean±std)",
+        "g-ratio",
         "axon diam µm",
-        "myelin thick µm",
         "density /mm²",
     ]
 
@@ -339,12 +341,14 @@ def _plot_summary_table(ax, groups, labels, colors, agg_df, nratios):
                 lbl,
                 _n_images(lbl),
                 str(len(df)),
+                _agg_mean(lbl, "nerve_area_mm2"),
+                _agg_mean(lbl, "total_axon_area_mm2"),
+                _agg_mean(lbl, "total_myelin_area_mm2"),
                 f"{nratios[lbl]:.3f}"
                 if lbl in nratios and np.isfinite(nratios.get(lbl, np.nan))
                 else _agg_mean(lbl, "nratio"),
                 _fiber_stat(df, "gratio", ".3f"),
                 _fiber_stat(df, "axon_diam", ".2f"),
-                _fiber_stat(df, "myelin_thickness", ".2f"),
                 _agg_mean(lbl, "axon_density_mm2"),
             ]
         )
@@ -498,6 +502,12 @@ def make_comparison_summary(groups, labels, out_path, nratios=None, agg_df=None)
                 "nerve_area_mm2_mean": sub_agg["nerve_area_mm2"].mean()
                 if "nerve_area_mm2" in sub_agg
                 else float("nan"),
+                "total_axon_area_mm2_mean": sub_agg["total_axon_area_mm2"].mean()
+                if "total_axon_area_mm2" in sub_agg
+                else float("nan"),
+                "total_myelin_area_mm2_mean": sub_agg["total_myelin_area_mm2"].mean()
+                if "total_myelin_area_mm2" in sub_agg
+                else float("nan"),
             }
         )
 
@@ -590,6 +600,9 @@ def main():
                 "mvf",
                 "axon_density_mm2",
                 "nerve_area_mm2",
+                "total_axon_area_mm2",
+                "total_myelin_area_mm2",
+                "n_axons",
             ]:
                 if col in agg.columns:
                     agg_row[col] = float(agg[col].iloc[0])

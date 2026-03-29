@@ -180,7 +180,10 @@ def _styled_table(ax, rows, n_pass, n_rej):
         "Aggregate G-ratio",
         "AVF  (axon volume fraction)",
         "MVF  (myelin volume fraction)",
-        "N-ratio  (fibers / total)",
+        "N-ratio  (fibers / nerve)",
+        "Nerve area (mm²)",
+        "Total axon area (mm²)",
+        "Total myelin area (mm²)",
     }
     key_rows = {
         r: rows[r - 1]
@@ -614,7 +617,7 @@ def make_dashboard(
             breakdown.append(("∅  No axon detected", n_no_axon, "#E74C3C"))
 
         # Draw horizontal bars
-        inset_bd = ax_right.inset_axes([0.0, 0.52, 1.0, 0.46])
+        inset_bd = ax_right.inset_axes([0.0, 0.55, 1.0, 0.43])
         inset_bd.axis("off")
         total_all = max(sum(v for _, v, _ in breakdown), 1)
         for i, (label, count, color) in enumerate(reversed(breakdown)):
@@ -632,7 +635,7 @@ def make_dashboard(
         inset_bd.set_xlim(-0.55, 1.18)
         inset_bd.set_ylim(-0.6, len(breakdown) - 0.4)
 
-        # Metrics table (bottom half)
+        # Metrics table (bottom half) — clinician key metrics first
         tbl_rows = [
             ["Cellpose fibers", str(n_outer)],
             ["— valid", str(len(df))],
@@ -640,16 +643,18 @@ def make_dashboard(
             ["— multi-core", str(n_multicore)],
             ["— no axon", str(n_no_axon)],
             ["Nerve area (mm²)", f"{agg.get('nerve_area_mm2', 0):.4f}"],
+            ["Total myelin area (mm²)", f"{agg.get('total_myelin_area_mm2', 0):.4f}"],
+            ["Total axon area (mm²)", f"{agg.get('total_axon_area_mm2', 0):.4f}"],
+            ["N-ratio  (fibers / nerve)", f"{agg.get('nratio', 0):.4f}"],
+            ["Aggregate G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
             ["AVF  (axon volume fraction)", f"{agg.get('avf', 0):.4f}"],
             ["MVF  (myelin volume fraction)", f"{agg.get('mvf', 0):.4f}"],
-            ["N-ratio  (fibers / total)", f"{agg.get('nratio', 0):.4f}"],
-            ["Aggregate G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
             ["Axon density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
             ["Mean axon diameter", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
             ["Mean fiber diameter", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
             ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
         ]
-        inset_tbl = ax_right.inset_axes([0.0, 0.0, 1.0, 0.50])
+        inset_tbl = ax_right.inset_axes([0.0, 0.0, 1.0, 0.53])
         _styled_table(inset_tbl, tbl_rows, len(df), len(df_rej))
 
         fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
