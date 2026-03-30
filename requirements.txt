@@ -7,3 +7,5 @@ matplotlib
 Pillow
 cellpose==4.0.9
 torch
+fastapi
+uvicorn

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Nerve Validator</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <span class="logo">Nerve Validator</span>
+    <div class="nav-group">
+      <button id="btn-prev" title="Previous (Left arrow)">&#9664;</button>
+      <span id="current-stem">--</span>
+      <button id="btn-next" title="Next (Right arrow)">&#9654;</button>
+    </div>
+    <div class="toolbar">
+      <button class="mode-btn active" data-mode="navigate">1 Navigate</button>
+      <button class="mode-btn" data-mode="delete">2 Delete</button>
+      <button class="mode-btn" data-mode="fiber">3 + Fiber</button>
+    </div>
+    <span class="sep"></span>
+    <div class="toolbar">
+      <button id="btn-recompute" class="action green">Recompute</button>
+      <button id="btn-reset" class="action amber">Reset</button>
+      <button id="btn-recompute-all" class="action blue">Recompute All</button>
+      <span id="batch-progress" class="batch-progress"></span>
+    </div>
+    <span class="sep"></span>
+    <div class="toolbar">
+      <button class="view-btn" data-view="numbered" title="Open numbered image">Numbered</button>
+      <button class="view-btn" data-view="dashboard" title="Open dashboard">Dashboard</button>
+      <button class="view-btn" data-view="gratio_map" title="Open G-ratio map">G-ratio</button>
+      <button id="btn-compare" class="action blue" title="Open multi-image comparison">Compare</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <span class="sidebar-title">Images</span>
+        <span id="img-count" class="badge">0</span>
+      </div>
+      <ul id="img-list"></ul>
+    </aside>
+
+    <section id="viewer">
+      <canvas id="canvas"></canvas>
+      <div id="hint" class="hint">No images found. Run the pipeline first.</div>
+      <div id="loading" class="loading hidden">Loading...</div>
+      <div id="status-bar">
+        <span id="coords">--</span>
+        <span id="zoom-info">100%</span>
+        <span id="edit-info"></span>
+      </div>
+    </section>
+
+    <aside id="panel">
+      <h3>Clinician Metrics</h3>
+      <table id="tbl-metrics"><tbody></tbody></table>
+      <h3 class="mt">Segmentation</h3>
+      <table id="tbl-seg"><tbody></tbody></table>
+      <div id="shortcuts" class="mt">
+        <h3>Shortcuts</h3>
+        <div class="sc">1/2/3 &mdash; mode</div>
+        <div class="sc">Left/Right &mdash; prev/next</div>
+        <div class="sc">F &mdash; fit to view</div>
+        <div class="sc">Scroll &mdash; zoom</div>
+        <div class="sc">Right-drag / Space+drag &mdash; pan</div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toasts"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

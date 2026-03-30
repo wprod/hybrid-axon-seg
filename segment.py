@@ -26,43 +26,44 @@ from detection import find_axons, run_cellpose_fibers
 from morphometrics import process_fibers
 from preprocessing import build_axon_input
 from qc import apply_qc
-from utils import clean_stem
-from visualization import make_dashboard, make_gratio_map, make_numbered, make_overlay
+from utils import build_fascicle_mask, clean_stem, find_low_qc_cluster_labels, find_satellite_labels
+from visualization import (
+    make_comparison,
+    make_dashboard,
+    make_gratio_map,
+    make_numbered,
+    make_overlay,
+)
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def _keep_main_cluster(outer_labels: np.ndarray, dilation_px: int) -> np.ndarray:
-    """Zero out all fibers not belonging to the largest spatial cluster.
-
-    Dilates the union of all fiber masks to merge nearby fibers into groups,
-    then discards every fiber whose centroid falls outside the largest component.
-    """
-    from skimage import morphology as morph
-
-    fiber_mask = outer_labels > 0
-    merged = morph.binary_dilation(fiber_mask, morph.disk(dilation_px))
-    cluster_map = measure.label(merged)
-
-    props = measure.regionprops(cluster_map)
-    if not props:
+def _remove_labels(outer_labels: np.ndarray, labels_to_remove: set) -> np.ndarray:
+    """Zero out the given fiber labels."""
+    if not labels_to_remove:
         return outer_labels
-    main_label = max(props, key=lambda p: p.area).label
-    keep = cluster_map == main_label
-
-    # Zero out any fiber whose centroid is outside the main cluster
     cleaned = outer_labels.copy()
-    for p in measure.regionprops(outer_labels):
-        cy, cx = int(p.centroid[0]), int(p.centroid[1])
-        if not keep[cy, cx]:
-            cleaned[outer_labels == p.label] = 0
+    remove_mask = np.isin(outer_labels, list(labels_to_remove))
+    cleaned[remove_mask] = 0
     return cleaned
 
 
 # ── Single-image pipeline ────────────────────────────────────────────────────
 
 
-def process_image(img_path: Path) -> tuple[str, int, dict]:
+def _parse_folder(name: str) -> tuple[str, str]:
+    """'ALLO A 12w' → ('ALLO A', '12w').  Falls back to (name, '') if no match."""
+    import re
+
+    m = re.search(r"(\d+w)\s*$", name.strip())
+    if m:
+        timepoint = m.group(1)
+        group = name.strip()[: m.start()].strip()
+        return group, timepoint
+    return name.strip(), ""
+
+
+def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple[str, int, dict]:
     stem = clean_stem(img_path)
     print(f"\n{'=' * 60}")
     print(f"  {img_path.name}  →  {stem}")
@@ -101,8 +102,9 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
         dist = distance_transform_edt(~border)
         outer_labels = (outer_labels * (dist > config.OUTER_ERODE_PX)).astype(outer_labels.dtype)
 
-    if config.MAIN_CLUSTER_DILATION_PX > 0:
-        outer_labels = _keep_main_cluster(outer_labels, config.MAIN_CLUSTER_DILATION_PX)
+    # Remove satellite fibers (low local neighbour density)
+    satellites = find_satellite_labels(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    outer_labels = _remove_labels(outer_labels, satellites)
 
     n_outer = int(outer_labels.max())
     print(f"       → {n_outer} fibers")
@@ -155,14 +157,23 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
     df_pass, df_rej = apply_qc(df_all)
     print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
 
-    # Recompute aggregate stats from QC-passed fibers only
-    # Use fascicle area (morphologically closed fiber mask) as denominator
-    from scipy.ndimage import binary_fill_holes as _fill_holes
-    from scipy.ndimage import gaussian_filter as _gauss
-    from skimage import morphology as _morph
+    # Remove low-QC clusters (tissue noise with poor axon detection rate)
+    bad_cluster_labels = find_low_qc_cluster_labels(
+        outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+    )
+    if bad_cluster_labels:
+        outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
+        inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
+        keep_fibers = lambda df: df[~df["_fiber_label"].isin(bad_cluster_labels)]
+        df_pass = keep_fibers(df_pass)
+        df_rej = keep_fibers(df_rej)
+        print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
 
-    _closed = _fill_holes(_morph.binary_closing(outer_labels > 0, _morph.disk(30)))
-    fascicle_mask = _gauss(_closed.astype(np.float32), sigma=40) > 0.35
+    # Build fascicle mask from cleaned labels (for nerve area + viz boundary)
+    fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
+
+    # Recompute aggregate stats from QC-passed fibers only
     nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
     if len(df_pass) and nerve_um2:
         total_axon_um2 = df_pass["axon_area"].sum()
@@ -170,6 +181,8 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
         avf = total_axon_um2 / nerve_um2
         mvf = total_myelin_um2 / nerve_um2
         agg = {
+            "group": group,
+            "timepoint": timepoint,
             "n_axons": len(df_pass),
             "nerve_area_mm2": nerve_um2 * 1e-6,
             "total_axon_area_mm2": total_axon_um2 * 1e-6,
@@ -182,6 +195,8 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
         }
     else:
         agg = {
+            "group": group,
+            "timepoint": timepoint,
             "n_axons": 0,
             "nerve_area_mm2": 0.0,
             "total_axon_area_mm2": 0.0,
@@ -233,20 +248,30 @@ def process_image(img_path: Path) -> tuple[str, int, dict]:
 
 def main() -> None:
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Build list of (image_path, group, timepoint)
     if len(sys.argv) > 1:
-        images = [Path(p) for p in sys.argv[1:]]
+        image_tuples = [(Path(p), "", "") for p in sys.argv[1:]]
     else:
-        images = sorted(
-            p for p in config.INPUT_DIR.iterdir() if p.suffix.lower() in (".tif", ".tiff", ".png")
-        )
-    if not images:
+        image_tuples = []
+        _EXTS = {".tif", ".tiff", ".png"}
+        for child in sorted(config.INPUT_DIR.iterdir()):
+            if child.is_dir():
+                group, timepoint = _parse_folder(child.name)
+                for p in sorted(child.glob("*")):
+                    if p.suffix.lower() in _EXTS:
+                        image_tuples.append((p, group, timepoint))
+            elif child.suffix.lower() in _EXTS:
+                image_tuples.append((child, "", ""))
+
+    if not image_tuples:
         sys.exit(f"No images found in {config.INPUT_DIR}")
 
-    print(f"Found {len(images)} image(s) in {config.INPUT_DIR}\n")
+    print(f"Found {len(image_tuples)} image(s) in {config.INPUT_DIR}\n")
     results = []
-    for p in images:
+    for p, group, timepoint in image_tuples:
         try:
-            stem, n, agg = process_image(p)
+            stem, n, agg = process_image(p, group=group, timepoint=timepoint)
             results.append({"image": stem, "n_axons": n, **agg})
         except Exception as e:
             print(f"  ✗ {p.name}: {e}")
@@ -259,6 +284,10 @@ def main() -> None:
         print(f"Done — {len(results)}/{len(images)} images")
         print(summary.to_string(index=False))
         print(f"{'=' * 60}")
+
+        print("  Generating comparison figure…")
+        make_comparison(results, config.OUTPUT_DIR / "comparison.png")
+        print(f"  ✓ comparison.png → {config.OUTPUT_DIR}")
 
 
 if __name__ == "__main__":

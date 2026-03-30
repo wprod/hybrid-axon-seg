@@ -24,7 +24,7 @@ from skimage import morphology
 from skimage.segmentation import find_boundaries
 
 import config
-from utils import load_font, to_rgb_uint8
+from utils import build_fascicle_mask, load_font, to_rgb_uint8
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
@@ -230,22 +230,7 @@ def make_overlay(
         ).astype(np.uint8)
 
     # ── Fascicle boundary — striped overlay drawn first (behind everything) ──
-    from scipy.ndimage import binary_fill_holes, gaussian_filter, uniform_filter
-    from skimage import measure as _measure
-
-    gray = rgb[:, :, 0].astype(np.float32)
-    local_mean = uniform_filter(gray, size=15)
-    local_sq_mean = uniform_filter(gray**2, size=15)
-    local_std = np.sqrt(np.clip(local_sq_mean - local_mean**2, 0, None))
-    tissue_mask = local_std > 4.0
-    closed = binary_fill_holes(morphology.binary_closing(tissue_mask, morphology.disk(60)))
-    labeled_cc = _measure.label(closed)
-    if labeled_cc.max() > 1:
-        sizes = np.bincount(labeled_cc.ravel())
-        sizes[0] = 0
-        threshold = sizes.max() * 0.01
-        closed = np.isin(labeled_cc, np.where(sizes >= threshold)[0])
-    fascicle_mask = gaussian_filter(closed.astype(np.float32), sigma=60) > 0.45
+    fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
 
     # 2px semi-transparent white perimeter
     fascicle_boundary = find_boundaries(fascicle_mask, mode="outer")
@@ -658,4 +643,207 @@ def make_dashboard(
         _styled_table(inset_tbl, tbl_rows, len(df), len(df_rej))
 
         fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+        plt.close(fig)
+
+
+# ── Multi-image comparison ────────────────────────────────────────────────────
+
+
+def _detect_group(name: str) -> str:
+    """Extract a study-group label from an image stem/filename."""
+    import re
+
+    _KNOWN = [
+        (re.compile(r"^BMSC", re.I), "BMSC"),
+        (re.compile(r"^OSC", re.I), "OSC"),
+        (re.compile(r"^Autob", re.I), "Autob"),
+        (re.compile(r"^Allo", re.I), "Allo"),
+    ]
+    for pat, label in _KNOWN:
+        if pat.match(name):
+            return label
+    # Generic fallback: leading alpha token
+    m = re.match(r"^([A-Za-z]+)", name)
+    return m.group(1) if m else "Other"
+
+
+def make_comparison(results: list[dict], out_path) -> None:
+    """Save a group × timepoint comparison figure (mean ± SD + individual dots).
+
+    Groups and timepoints are read from the ``group`` / ``timepoint`` fields
+    injected by the pipeline.  Falls back to filename-based auto-detection when
+    those fields are absent or empty.
+
+    Layout: 2 × 3 metric panels.  Each panel shows one bar cluster per group,
+    with one bar per timepoint (side-by-side, coloured by timepoint).
+    Individual animal data points are overlaid as jittered dots.
+    """
+    from collections import defaultdict
+
+    if not results:
+        return
+
+    # ── Resolve groups and timepoints ────────────────────────────────────
+    def _g(r):
+        g = str(r.get("group") or "").strip()
+        return g if g else _detect_group(r.get("image", ""))
+
+    def _tp(r):
+        return str(r.get("timepoint") or "").strip()
+
+    # Stable insertion-order lists
+    groups: list[str] = []
+    timepoints: list[str] = []
+    for r in results:
+        g, tp = _g(r), _tp(r)
+        if g and g not in groups:
+            groups.append(g)
+        if tp and tp not in timepoints:
+            timepoints.append(tp)
+
+    groups = sorted(groups)
+    timepoints = sorted(timepoints)  # e.g. ["12w", "16w"]
+    n_groups = len(groups)
+    n_tp = max(len(timepoints), 1)
+
+    # ── Build lookup (group, timepoint) → [values] ───────────────────────
+    data: dict[tuple, list] = defaultdict(list)
+    for r in results:
+        data[(_g(r), _tp(r))].append(r)
+
+    # ── Colors ───────────────────────────────────────────────────────────
+    _TP_COLORS = ["#3498DB", "#E67E22", "#27AE60", "#8E44AD"]
+    tp_color = {tp: _TP_COLORS[i % len(_TP_COLORS)] for i, tp in enumerate(timepoints)}
+    if not timepoints:
+        # Single-timepoint fallback: one color per group
+        cmap_g = matplotlib.colormaps["Set2"]
+        grp_color = {g: cmap_g(i / max(n_groups, 1)) for i, g in enumerate(groups)}
+
+    # ── Metrics ──────────────────────────────────────────────────────────
+    _metrics = [
+        ("nerve_area_mm2", "Nerve area", "mm²", None),
+        ("n_axons", "N axons", "", None),
+        ("nratio", "N-ratio", "", None),
+        ("total_axon_area_mm2", "Axon area", "mm²", None),
+        ("total_myelin_area_mm2", "Myelin area", "mm²", None),
+        ("gratio_aggr", "G-ratio", "", 0.60),
+    ]
+
+    x_pos = np.arange(n_groups)
+    bw = 0.80 / max(n_tp, 1)  # bar width
+    rng = np.random.default_rng(42)
+
+    with plt.rc_context(_DASH_STYLE):
+        fig = plt.figure(figsize=(max(16, n_groups * 1.6), 10), facecolor=_CLR["bg"])
+        tp_str = " · ".join(timepoints) if timepoints else "all"
+        fig.suptitle(
+            f"Group Comparison  ·  {len(results)} images  ·  {tp_str}",
+            fontsize=15,
+            weight="bold",
+            color=_CLR["text"],
+            y=0.99,
+        )
+        gs = fig.add_gridspec(
+            2,
+            3,
+            hspace=0.55,
+            wspace=0.40,
+            left=0.07,
+            right=0.97,
+            top=0.92,
+            bottom=0.10,
+        )
+
+        for idx, (col, title, unit_lbl, ref) in enumerate(_metrics):
+            ax = fig.add_subplot(gs[idx // 3, idx % 3])
+            all_vals_flat: list[float] = []
+
+            tp_iter = timepoints if timepoints else [""]
+            for ti, tp in enumerate(tp_iter):
+                offset = (ti - (n_tp - 1) / 2) * bw
+                color = tp_color.get(tp) if timepoints else None
+
+                for gi, g in enumerate(groups):
+                    key = (g, tp)
+                    recs = data[key]
+                    vals = [float(r.get(col) or 0) for r in recs]
+                    if not vals:
+                        continue
+                    all_vals_flat.extend(vals)
+                    mean_v = float(np.mean(vals))
+                    std_v = float(np.std(vals, ddof=0))
+                    bar_color = color if color else grp_color.get(g, "#888")
+
+                    ax.bar(
+                        gi + offset,
+                        mean_v,
+                        yerr=std_v,
+                        width=bw * 0.88,
+                        color=bar_color,
+                        alpha=0.82,
+                        capsize=4,
+                        error_kw={"linewidth": 1.5, "capthick": 1.5},
+                        edgecolor="white",
+                        linewidth=0.3,
+                        zorder=2,
+                        label=tp if (gi == 0 and timepoints) else "_nolegend_",
+                    )
+                    # Individual dots
+                    if len(vals) > 1:
+                        jitter = rng.uniform(-bw * 0.22, bw * 0.22, len(vals))
+                        ax.scatter(
+                            gi + offset + jitter,
+                            vals,
+                            color="black",
+                            s=22,
+                            alpha=0.50,
+                            zorder=4,
+                            linewidths=0,
+                        )
+                    elif len(vals) == 1:
+                        ax.scatter(
+                            gi + offset,
+                            vals,
+                            color="black",
+                            s=22,
+                            alpha=0.60,
+                            zorder=4,
+                            linewidths=0,
+                        )
+
+            # Reference line
+            if ref is not None:
+                ax.axhline(ref, color=_CLR["rej"], lw=1.3, ls="--", label=f"ref = {ref}", zorder=3)
+
+            if timepoints:
+                ax.legend(loc="upper right", fontsize=7.5, framealpha=0.85)
+
+            # n= labels per group (below x-axis)
+            for gi, g in enumerate(groups):
+                n_total = sum(len(data[(g, tp)]) for tp in tp_iter)
+                ax.text(
+                    gi,
+                    0,
+                    f"n={n_total}",
+                    ha="center",
+                    va="top",
+                    fontsize=6.5,
+                    color=_CLR["muted"],
+                    transform=ax.get_xaxis_transform(),
+                )
+
+            ymax = max(all_vals_flat) if all_vals_flat else 1.0
+            ax.set_ylim(bottom=0, top=ymax * 1.30)
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels(groups, fontsize=8, rotation=30, ha="right")
+            ylabel = f"{title} ({unit_lbl})" if unit_lbl else title
+            ax.set(title=title, ylabel=ylabel)
+            ax.yaxis.set_major_locator(plt.MaxNLocator(5))
+
+        fig.savefig(
+            str(out_path),
+            dpi=150,
+            bbox_inches="tight",
+            facecolor=fig.get_facecolor(),
+        )
         plt.close(fig)

@@ -37,7 +37,8 @@ MAX_CENTROID_OFFSET = 0.95
 MAX_AXON_ECCEN = 1.0  # effectively disabled — set < 1.0 to re-enable
 EXCLUDE_BORDER = True
 
-# Isolated cluster removal: dilate fiber mask by this radius to merge nearby fibers,
-# then discard all fibers not belonging to the largest connected component.
-# Increase if the main nerve has large internal gaps; set to 0 to disable.
-MAIN_CLUSTER_DILATION_PX = 0
+# Satellite detection — fibers with fewer than this many neighbours
+# within 5× fiber diameter are considered satellites and removed
+MIN_SATELLITE_NEIGHBORS = 15
+MIN_CLUSTER_QC_RATE = 0.50  # clusters with QC pass rate below this are removed
+MIN_CLUSTER_FRACTION = 0.10  # clusters with < 10% of the largest cluster's fiber count are removed
