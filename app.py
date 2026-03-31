@@ -6,7 +6,10 @@ Launch:
     python app.py          # opens http://127.0.0.1:8000
 """
 
+import contextlib
 import json
+import os
+import secrets
 import shutil
 import threading
 from pathlib import Path
@@ -14,8 +17,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from skimage import io, measure
@@ -33,7 +37,24 @@ from visualization import (
     make_overlay,
 )
 
-app = FastAPI(title="Nerve Segmentation Validator")
+_AUTH_USER = "axon"
+_AUTH_PASS = os.environ.get("APP_PASSWORD") or secrets.token_urlsafe(10)
+
+_security = HTTPBasic()
+
+
+def _check_auth(creds: HTTPBasicCredentials = Depends(_security)):  # noqa: B008
+    ok_user = secrets.compare_digest(creds.username.encode(), _AUTH_USER.encode())
+    ok_pass = secrets.compare_digest(creds.password.encode(), _AUTH_PASS.encode())
+    if not (ok_user and ok_pass):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+
+app = FastAPI(title="Nerve Segmentation Validator", dependencies=[Depends(_check_auth)])
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
@@ -540,10 +561,8 @@ def recompute(stem: str):
     # Save CSVs
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
     df_pass[pub_cols].to_csv(d / f"{stem}_morphometrics.csv", index=False)
-    try:
+    with contextlib.suppress(ImportError):
         df_pass[pub_cols].to_excel(d / f"{stem}_morphometrics.xlsx", index=False)
-    except ImportError:
-        pass
     pd.DataFrame([agg]).to_csv(d / f"{stem}_aggregate.csv", index=False)
 
     # Visualizations
@@ -686,10 +705,8 @@ def _batch_recompute_worker(stems: list[str]):
 
             pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
             df_pass[pub_cols].to_csv(d / f"{stem}_morphometrics.csv", index=False)
-            try:
+            with contextlib.suppress(ImportError):
                 df_pass[pub_cols].to_excel(d / f"{stem}_morphometrics.xlsx", index=False)
-            except ImportError:
-                pass
             pd.DataFrame([agg]).to_csv(d / f"{stem}_aggregate.csv", index=False)
 
             raw_path = _find_raw(stem)
@@ -796,5 +813,6 @@ def recompute_summary():
 
 if __name__ == "__main__":
     print("\n  Nerve Segmentation Validator")
-    print("  http://127.0.0.1:8000\n")
+    print("  http://127.0.0.1:8000")
+    print(f"\n  Login  →  user: {_AUTH_USER}  |  password: {_AUTH_PASS}\n")
     uvicorn.run(app, host="127.0.0.1", port=8000)

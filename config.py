@@ -12,6 +12,9 @@ CP_MODEL = "cyto3"
 CP_DIAM_UM = 7.0  # expected fiber diameter (µm)
 CP_FLOW_THR = 0.4
 CP_CELLPROB = 0.0
+CP_CLAHE = False  # apply CLAHE before Cellpose to boost local contrast
+CLAHE_CLIP_LIMIT = 0.02  # CLAHE clip limit (0–1); higher = more aggressive
+CLAHE_TILE_SIZE = (64, 64)  # local tile size for CLAHE kernel
 
 # Inversion / preprocessing
 MASK_ERODE_PX = 4  # px stripped from fiber boundary before normalization

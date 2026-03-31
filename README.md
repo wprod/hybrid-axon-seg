@@ -13,19 +13,22 @@ and axon density — with full QC overlay output.
 
 1. [Overview](#overview)
 2. [Quick Start](#quick-start)
-3. [Pipeline Architecture](#pipeline-architecture)
+3. [Web Validation UI](#web-validation-ui)
+   - [Running the App](#running-the-app)
+   - [Remote Access (Cloudflare Tunnel)](#remote-access-cloudflare-tunnel)
+4. [Pipeline Architecture](#pipeline-architecture)
    - [Step 1 — Cellpose Pass 1: Outer Fibers](#step-1--cellpose-pass-1-outer-fibers)
    - [Step 2 — Normalized Inversion: Building `axon_input`](#step-2--normalized-inversion-building-axon_input)
    - [Step 3 — Global Otsu Axon Detection](#step-3--global-otsu-axon-detection)
    - [Step 4 — Morphometrics](#step-4--morphometrics)
    - [Step 5 — QC Filtering](#step-5--qc-filtering)
    - [Step 6 — Visualizations](#step-6--visualizations)
-4. [Mathematics](#mathematics)
-5. [Configuration Reference](#configuration-reference)
-6. [Output Files](#output-files)
-7. [Module Structure](#module-structure)
-8. [Overlay Color Scheme](#overlay-color-scheme)
-9. [References](#references)
+5. [Mathematics](#mathematics)
+6. [Configuration Reference](#configuration-reference)
+7. [Output Files](#output-files)
+8. [Module Structure](#module-structure)
+9. [Overlay Color Scheme](#overlay-color-scheme)
+10. [References](#references)
 
 ---
 
@@ -74,6 +77,58 @@ python segment.py "edited/MyImage.tif"
 ```
 
 All parameters are in `config.py` — no code changes needed for routine use.
+
+---
+
+## Web Validation UI
+
+`app.py` is a FastAPI-based browser UI for manual review and correction of segmentation results. It lets a clinician inspect every image, delete false-positive axons, draw missing ones, and trigger recomputation — without touching the command line.
+
+### Running the App
+
+```bash
+python app.py
+# → http://127.0.0.1:8000
+#   Login  →  user: axon  |  password: <randomly generated>
+```
+
+The password is printed in the terminal at startup and changes every run. To fix a permanent password:
+
+```bash
+APP_PASSWORD=mypassword python app.py
+```
+
+**Features:**
+
+| Action | How |
+|---|---|
+| Browse all images | Sidebar list with axon count and edit status |
+| View overlay / numbered / dashboard / g-ratio map | Tabs per image |
+| Delete a false-positive axon | Click on it |
+| Add a missing axon | Draw polygon inside a fiber |
+| Add a brand-new fiber | Draw outer + inner polygons |
+| Recompute morphometrics | "Recompute" button (single image) |
+| Recompute all images + rebuild summary | "Recompute All" button |
+| Rebuild comparison figure only | "Rebuild Summary" button |
+
+All edits are saved to `*_edits.json` and original `.npy` files are kept as `*_original.npy` backups. A "Reset" button restores any image to its pre-edit state.
+
+### Remote Access (Cloudflare Tunnel)
+
+To let a collaborator access the app from another computer without any VPN or port-forwarding setup:
+
+```bash
+# 1. Install cloudflared (one-time)
+brew install cloudflare/cloudflare/cloudflared
+
+# 2. Start the app and the tunnel in two terminals
+python app.py
+cloudflared tunnel --url http://localhost:8000
+```
+
+Cloudflare prints a public URL (e.g. `https://xyz-abc.trycloudflare.com`). Send it along with the login credentials shown in the app terminal. The tunnel is active only while both processes are running — close them when the session is done.
+
+> The app requires HTTP Basic Auth (username + password) for every request, so the tunnel cannot be accessed without credentials.
 
 ---
 
@@ -515,6 +570,7 @@ A global `output/summary.csv` collects aggregate metrics across all images.
 ```
 hybrid-axon-seg/
 ├── segment.py          # Entry point — process_image() + main()
+├── app.py              # Web validation UI (FastAPI) — manual correction + recompute
 ├── config.py           # All tunable parameters
 ├── utils.py            # Image type conversion + font loading
 ├── preprocessing.py    # Per-fiber normalized inversion → axon_input

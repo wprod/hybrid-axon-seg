@@ -9,6 +9,7 @@ Color scheme
   RED                           = fiber with no axon detected (other)
 """
 
+import math
 import warnings
 
 import matplotlib
@@ -685,11 +686,14 @@ def make_comparison(results: list[dict], out_path) -> None:
 
     # ── Resolve groups and timepoints ────────────────────────────────────
     def _g(r):
-        g = str(r.get("group") or "").strip()
+        g = r.get("group", "")
+        g = "" if (g is None or (isinstance(g, float) and math.isnan(g))) else str(g).strip()
         return g if g else _detect_group(r.get("image", ""))
 
     def _tp(r):
-        return str(r.get("timepoint") or "").strip()
+        tp = r.get("timepoint", "")
+        tp = "" if (tp is None or (isinstance(tp, float) and math.isnan(tp))) else str(tp).strip()
+        return tp
 
     # Stable insertion-order lists
     groups: list[str] = []

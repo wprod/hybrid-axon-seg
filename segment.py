@@ -164,7 +164,10 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     if bad_cluster_labels:
         outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
         inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
-        keep_fibers = lambda df: df[~df["_fiber_label"].isin(bad_cluster_labels)]
+
+        def keep_fibers(df):
+            return df[~df["_fiber_label"].isin(bad_cluster_labels)]
+
         df_pass = keep_fibers(df_pass)
         df_rej = keep_fibers(df_rej)
         print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
@@ -270,6 +273,13 @@ def main() -> None:
     print(f"Found {len(image_tuples)} image(s) in {config.INPUT_DIR}\n")
     results = []
     for p, group, timepoint in image_tuples:
+        stem = clean_stem(p)
+        agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
+        if agg_path.exists():
+            print(f"  ↷ {stem}  (already processed, skipping)")
+            agg = pd.read_csv(agg_path).iloc[0].to_dict()
+            results.append({"image": stem, **agg})
+            continue
         try:
             stem, n, agg = process_image(p, group=group, timepoint=timepoint)
             results.append({"image": stem, "n_axons": n, **agg})
@@ -281,7 +291,7 @@ def main() -> None:
         summary = pd.DataFrame(results)
         summary.to_csv(config.OUTPUT_DIR / "summary.csv", index=False)
         print(f"\n{'=' * 60}")
-        print(f"Done — {len(results)}/{len(images)} images")
+        print(f"Done — {len(results)}/{len(image_tuples)} images")
         print(summary.to_string(index=False))
         print(f"{'=' * 60}")
 

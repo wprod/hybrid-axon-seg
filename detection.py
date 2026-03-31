@@ -17,6 +17,39 @@ from skimage.filters import threshold_otsu
 import config
 
 
+def _clahe_preprocess(img: np.ndarray) -> np.ndarray:
+    """Apply CLAHE on the green channel (or grayscale) to boost local contrast.
+
+    Works on uint8 or uint16 input; always returns uint8 suitable for Cellpose.
+    Operates channel-by-channel if RGB, otherwise on the single channel.
+    """
+    from skimage import exposure
+    from skimage.util import img_as_ubyte
+
+    # Clip range (tiny percentile for robustness against hot pixels)
+    clip = getattr(config, "CLAHE_CLIP_LIMIT", 0.02)
+    tile = getattr(config, "CLAHE_TILE_SIZE", (64, 64))
+
+    if img.ndim == 3:
+        out = np.empty_like(img if img.dtype == np.uint8 else img.astype(np.uint8))
+        for c in range(img.shape[2]):
+            ch = img[:, :, c]
+            ch_f = ch.astype(np.float32) / (
+                np.iinfo(ch.dtype).max if np.issubdtype(ch.dtype, np.integer) else 1.0
+            )
+            out[:, :, c] = img_as_ubyte(
+                np.clip(exposure.equalize_adapthist(ch_f, kernel_size=tile, clip_limit=clip), 0, 1)
+            )
+        return out
+    else:
+        ch_f = img.astype(np.float32) / (
+            np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
+        )
+        return img_as_ubyte(
+            np.clip(exposure.equalize_adapthist(ch_f, kernel_size=tile, clip_limit=clip), 0, 1)
+        )
+
+
 def run_cellpose_fibers(img: np.ndarray) -> np.ndarray:
     """Run Cellpose (cyto3) on *img* → integer label array (0 = background)."""
     import torch
@@ -31,6 +64,10 @@ def run_cellpose_fibers(img: np.ndarray) -> np.ndarray:
         else "CPU"
     )
     print(f"       device: {device}")
+
+    if getattr(config, "CP_CLAHE", False):
+        print("       applying CLAHE…")
+        img = _clahe_preprocess(img)
 
     model = models.CellposeModel(pretrained_model=config.CP_MODEL, gpu=gpu)
     masks, _, _ = model.eval(
