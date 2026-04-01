@@ -24,13 +24,31 @@ class App {
     this.drawing = false;
     this.drawPts = [];
 
-    // fiber mode (two-step: outer then inner)
-    this.fiberStep = 0;   // 0 = drawing outer, 1 = drawing inner
-    this.outerPoly = [];  // stored after first draw
+    // fiber mode (two-step lasso: outer then inner)
+    this.fiberStep = 0;
+    this.outerPoly = [];
+
+    // fascicle polygon mode (click-to-add-point)
+    this.fascPts = [];          // confirmed vertices (image coords)
+    this.fascMouse = null;      // live cursor pos for preview
+    this._lastFascClick = 0;    // double-click detection
+    this.savedFasc = null;      // saved boundary [[x,y],…] from server
+
+    // processed state per stem
+    this.processedMap = new Map();
 
     // annotations (brief markers before overlay refreshes)
     this.anns = [];
     this.editCount = 0;
+
+    // raw image for opacity blending
+    this.rawImg = null;
+    this.overlayOpacity = 0.85;
+
+    // Easter egg key buffer 💙
+    this._keyBuffer = '';
+    this._logoClicks = 0;
+    this._logoTimer = null;
 
     this.boot();
   }
@@ -60,6 +78,7 @@ class App {
     $$('.mode-btn').forEach(b => b.onclick = () => this.setMode(b.dataset.mode));
     $('#btn-recompute').onclick = () => this.recompute();
     $('#btn-reset').onclick = () => this.reset();
+    $('#btn-clear-fasc').onclick = () => this.clearFascicle();
     $('#btn-recompute-all').onclick = () => this.recomputeAll();
     $('#btn-compare').onclick = () => window.open('/api/comparison', '_blank');
     $('#btn-prev').onclick = () => this.nav(-1);
@@ -69,6 +88,24 @@ class App {
       if (this.cur) window.open(`/api/image/${this.cur}/${b.dataset.view}`, '_blank');
     });
 
+    // Opacity slider
+    $('#opacity-slider').oninput = e => {
+      this.overlayOpacity = e.target.value / 100;
+      $('#opacity-val').textContent = `${e.target.value}%`;
+      this.render();
+    };
+
+    // Easter egg — triple-click on logo 💙
+    $('.logo').onclick = () => {
+      this._logoClicks++;
+      clearTimeout(this._logoTimer);
+      this._logoTimer = setTimeout(() => { this._logoClicks = 0; }, 600);
+      if (this._logoClicks >= 3) {
+        this._logoClicks = 0;
+        this._marie('💙 Nerve Validator — fait avec amour pour toi, Marie !');
+      }
+    };
+
     this.cvs.addEventListener('mousedown', e => this.onDown(e));
     this.cvs.addEventListener('mousemove', e => this.onMove(e));
     document.addEventListener('mouseup', e => this.onUp(e));
@@ -77,6 +114,10 @@ class App {
       if (this.dragging) {
         this.dragging = false;
         $('#viewer').classList.remove('panning');
+      }
+      if (this.mode === 'fascicle' && this.fascMouse) {
+        this.fascMouse = null;
+        this.render();
       }
     });
     this.cvs.addEventListener('wheel', e => this.onWheel(e), { passive: false });
@@ -96,19 +137,28 @@ class App {
   }
 
   setMode(m) {
-    // Reset fiber flow when leaving fiber mode
     if (this.mode === 'fiber' && m !== 'fiber') {
-      this.fiberStep = 0;
-      this.outerPoly = [];
+      this.fiberStep = 0; this.outerPoly = [];
+    }
+    if (this.drawing && m !== this.mode) {
+      this.drawing = false; this.drawPts = [];
+    }
+    if (m !== 'fascicle') {
+      // Clear polygon when leaving fascicle
+      this.fascPts = []; this.fascMouse = null;
     }
     this.mode = m;
     $$('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === m));
     $('#viewer').className = `mode-${m}`;
     if (m === 'fiber') {
-      this.fiberStep = 0;
-      this.outerPoly = [];
+      this.fiberStep = 0; this.outerPoly = [];
       this.toast('Step 1/2 : draw myelin boundary (outer)', 'info');
     }
+    if (m === 'fascicle') {
+      this.fascPts = [];
+      this.toast('Click to place points — close by clicking the 1st point or double-click', 'info');
+    }
+    this.render();
   }
 
   /* ── Image list ──────────────────────────────────────────────────────── */
@@ -117,15 +167,20 @@ class App {
     const r = await fetch('/api/images');
     const imgs = await r.json();
     this.stems = imgs.map(i => i.stem);
+    this.processedMap = new Map(imgs.map(i => [i.stem, i.processed]));
     const ul = $('#img-list');
     ul.innerHTML = '';
     for (const i of imgs) {
       const li = document.createElement('li');
       li.dataset.stem = i.stem;
+      const dotCls = i.modified ? 'mod' : (i.processed ? 'orig' : 'raw');
+      const nLabel = i.processed ? `n=${i.n_axons}` : 'raw';
+      const resegBadge = i.needs_resegment ? `<span class="reseg-badge" title="Edits en attente — cliquer Recompute">⚠</span>` : '';
       li.innerHTML =
-        `<span class="dot ${i.modified ? 'mod' : 'orig'}"></span>` +
+        `<span class="dot ${dotCls}"></span>` +
         `<span class="img-name" title="${i.stem}">${i.stem}</span>` +
-        `<span class="img-n">n=${i.n_axons}</span>`;
+        `${resegBadge}` +
+        `<span class="img-n">${nLabel}</span>`;
       li.onclick = () => this.select(i.stem);
       ul.appendChild(li);
     }
@@ -138,24 +193,60 @@ class App {
     $$('#img-list li').forEach(li => li.classList.toggle('active', li.dataset.stem === stem));
 
     this.img = null;
+    this.rawImg = null;
     this.anns = [];
     this.editCount = 0;
+    this.savedFasc = null;
+    this._showFasciclePanel(false);
     this.render();
     $('#loading').classList.remove('hidden');
 
-    const im = new Image();
-    im.onload = () => {
+    const loadImg = src => new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = rej;
+      im.src = src;
+    });
+
+    (async () => {
+      const t = Date.now();
+      let im = null;
+      let fromRaw = false;
+      try {
+        im = await loadImg(`/api/image/${stem}/overlay?t=${t}`);
+      } catch {
+        try {
+          im = await loadImg(`/api/image/${stem}/raw?t=${t}`);
+          fromRaw = true;
+        } catch {
+          if (this.cur !== stem) return;
+          $('#loading').classList.add('hidden');
+          this.toast('Image not found', 'err');
+          return;
+        }
+      }
+      if (this.cur !== stem) return;
       this.img = im;
       $('#loading').classList.add('hidden');
       $('#hint').classList.add('hidden');
+      if (fromRaw) {
+        this.rawImg = im;
+      } else {
+        // Load raw in background for opacity blending
+        const rawIm = new Image();
+        rawIm.onload = () => { if (this.cur === stem) { this.rawImg = rawIm; this.render(); } };
+        rawIm.src = `/api/image/${stem}/raw?t=${t}`;
+      }
       this.fit();
-      this.loadInfo(stem);
-    };
-    im.onerror = () => {
-      $('#loading').classList.add('hidden');
-      this.toast('Failed to load overlay', 'err');
-    };
-    im.src = `/api/image/${stem}/overlay?t=${Date.now()}`;
+      if (fromRaw) {
+        this.showMetrics({});
+        this.showEditCount();
+        this.render();
+      } else {
+        this.loadInfo(stem);
+      }
+      this.loadFascicle(stem);
+    })();
   }
 
   async loadInfo(stem) {
@@ -167,6 +258,35 @@ class App {
     this.showMetrics(info.metrics);
     this.showEditCount();
     this.render();
+  }
+
+  async loadFascicle(stem) {
+    try {
+      const r = await fetch(`/api/image/${stem}/fascicle?t=${Date.now()}`);
+      if (!r.ok) return;
+      const d = await r.json();
+      if (this.cur !== stem) return;
+      const list = d.contours && d.contours.length > 0 ? d.contours : null;
+      this.savedFasc = list && list.length > 0 ? list : null;
+      this._showFasciclePanel(!!this.savedFasc);
+      this.render();
+    } catch (e) { console.warn('loadFascicle:', e); }
+  }
+
+  _showFasciclePanel(show) {
+    $('#fascicle-panel').classList.toggle('hidden', !show);
+  }
+
+  async clearFascicle() {
+    if (!this.cur) return;
+    try {
+      await fetch(`/api/image/${this.cur}/clear-fascicle`, { method: 'POST' });
+      this.savedFasc = null;
+      this._showFasciclePanel(false);
+      if (this.mode === 'fascicle') this.setMode('navigate');
+      this.render();
+      this.toast('Fascicle cleared', 'info');
+    } catch (err) { this.toast(err.message, 'err'); }
   }
 
   /* ── Metrics panel ───────────────────────────────────────────────────── */
@@ -226,7 +346,45 @@ class App {
     ctx.translate(this.panX, this.panY);
     ctx.scale(this.zoom, this.zoom);
 
-    if (this.img) ctx.drawImage(this.img, 0, 0);
+    // Draw raw first, then overlay with opacity for blending
+    if (this.rawImg && this.img && this.img !== this.rawImg) {
+      ctx.drawImage(this.rawImg, 0, 0);
+      ctx.globalAlpha = this.overlayOpacity;
+      ctx.drawImage(this.img, 0, 0);
+      ctx.globalAlpha = 1;
+    } else if (this.img) {
+      ctx.drawImage(this.img, 0, 0);
+    }
+
+    // Saved fascicle boundaries — hidden while actively drawing a replacement
+    if (this.savedFasc && this.savedFasc.length > 0 && this.fascPts.length === 0) {
+      ctx.save();
+      for (const contour of this.savedFasc) {
+        if (contour.length < 3) continue;
+        ctx.beginPath();
+        ctx.moveTo(contour[0][0], contour[0][1]);
+        for (let i = 1; i < contour.length; i++) ctx.lineTo(contour[i][0], contour[i][1]);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(241,196,15,0.07)';
+        ctx.fill();
+        ctx.strokeStyle = '#F1C40F';
+        ctx.lineWidth = 2.5 / this.zoom;
+        ctx.setLineDash([10 / this.zoom, 6 / this.zoom]);
+        ctx.shadowBlur = 6;
+        ctx.shadowColor = 'rgba(0,0,0,0.8)';
+        ctx.stroke();
+      }
+      // Label above topmost contour
+      ctx.setLineDash([]);
+      ctx.shadowBlur = 3;
+      const top = this.savedFasc[0].reduce((a, b) => a[1] < b[1] ? a : b);
+      const label = this.savedFasc.length > 1 ? `FASCICLE ×${this.savedFasc.length}` : 'FASCICLE';
+      ctx.font = `bold ${Math.max(11, 13 / this.zoom)}px sans-serif`;
+      ctx.fillStyle = '#F1C40F';
+      ctx.textAlign = 'center';
+      ctx.fillText(label, top[0], top[1] - 8 / this.zoom);
+      ctx.restore();
+    }
 
     const r = 14 / this.zoom, lw = 2.5 / this.zoom;
 
@@ -282,7 +440,7 @@ class App {
       ctx.restore();
     }
 
-    // In-progress drawing — blue when drawing outer, green when drawing inner/axon
+    // Fiber lasso (blue outer, green inner)
     if (this.drawPts.length > 1) {
       const isOuter = this.mode === 'fiber' && this.fiberStep === 0;
       const clr = isOuter ? '#2980B9' : '#66bb6a';
@@ -302,7 +460,132 @@ class App {
       ctx.restore();
     }
 
+    // Fascicle polygon (click-to-add vertices)
+    if (this.fascPts.length > 0) {
+      const lw = 2 / this.zoom;
+      ctx.save();
+
+      // Semi-transparent fill preview
+      if (this.fascPts.length >= 3) {
+        ctx.beginPath();
+        ctx.moveTo(this.fascPts[0].x, this.fascPts[0].y);
+        for (let i = 1; i < this.fascPts.length; i++)
+          ctx.lineTo(this.fascPts[i].x, this.fascPts[i].y);
+        if (this.fascMouse) ctx.lineTo(this.fascMouse.x, this.fascMouse.y);
+        ctx.closePath();
+        ctx.fillStyle = 'rgba(241,196,15,0.10)';
+        ctx.fill();
+      }
+
+      // Solid edges between confirmed vertices
+      if (this.fascPts.length > 1) {
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#F1C40F';
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.moveTo(this.fascPts[0].x, this.fascPts[0].y);
+        for (let i = 1; i < this.fascPts.length; i++)
+          ctx.lineTo(this.fascPts[i].x, this.fascPts[i].y);
+        ctx.stroke();
+      }
+
+      // Dashed preview edge to cursor
+      if (this.fascMouse) {
+        const last = this.fascPts[this.fascPts.length - 1];
+        ctx.setLineDash([5 / this.zoom, 4 / this.zoom]);
+        ctx.strokeStyle = 'rgba(241,196,15,0.7)';
+        ctx.lineWidth = lw;
+        ctx.beginPath();
+        ctx.moveTo(last.x, last.y);
+        ctx.lineTo(this.fascMouse.x, this.fascMouse.y);
+        ctx.stroke();
+      }
+
+      // Vertex dots
+      ctx.setLineDash([]);
+      for (let i = 0; i < this.fascPts.length; i++) {
+        const r = (i === 0 ? 5 : 3) / this.zoom;
+        ctx.beginPath();
+        ctx.arc(this.fascPts[i].x, this.fascPts[i].y, r, 0, Math.PI * 2);
+        ctx.fillStyle = i === 0 ? '#E67E22' : '#F1C40F';
+        ctx.fill();
+      }
+
+      // Closing-snap ring around first vertex (3+ pts and mouse close enough)
+      if (this.fascPts.length >= 3 && this.fascMouse) {
+        const snapR = 14 / this.zoom;
+        if (Math.hypot(this.fascMouse.x - this.fascPts[0].x, this.fascMouse.y - this.fascPts[0].y) < snapR) {
+          ctx.beginPath();
+          ctx.arc(this.fascPts[0].x, this.fascPts[0].y, snapR, 0, Math.PI * 2);
+          ctx.strokeStyle = 'rgba(241,196,15,0.6)';
+          ctx.lineWidth = lw;
+          ctx.setLineDash([3/this.zoom, 3/this.zoom]);
+          ctx.stroke();
+        }
+      }
+
+      ctx.restore();
+    }
+
     ctx.restore();
+
+    // Magnifying loupe — fascicle mode only, follows cursor (uses raw for precision)
+    const loupeImg = this.rawImg || this.img;
+    if (this.mode === 'fascicle' && this.fascMouse && loupeImg) {
+      const mx = this.fascMouse.x, my = this.fascMouse.y;
+      const sX = mx * this.zoom + this.panX;
+      const sY = my * this.zoom + this.panY;
+
+      const LR  = 72;   // loupe radius on screen (px)
+      const SRC = 52;   // source half-size in image px (fixed detail level)
+
+      // Keep loupe inside canvas — prefer top-right, flip if needed
+      let lX = sX + LR + 14;
+      let lY = sY - LR - 14;
+      if (lX + LR > cw) lX = sX - LR - 14;
+      if (lY - LR < 0)  lY = sY + LR + 14;
+
+      // Drop shadow
+      ctx.save();
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = 'rgba(0,0,0,0.65)';
+      ctx.beginPath();
+      ctx.arc(lX, lY, LR + 1, 0, Math.PI * 2);
+      ctx.fillStyle = '#000';
+      ctx.fill();
+      ctx.shadowBlur = 0;
+
+      // Clip to circle
+      ctx.beginPath();
+      ctx.arc(lX, lY, LR, 0, Math.PI * 2);
+      ctx.clip();
+
+      // Zoomed image (nearest-neighbour for crisp pixels)
+      const sx = Math.max(0, mx - SRC);
+      const sy = Math.max(0, my - SRC);
+      const sw = Math.min(loupeImg.naturalWidth  - sx, SRC * 2);
+      const sh = Math.min(loupeImg.naturalHeight - sy, SRC * 2);
+      ctx.imageSmoothingEnabled = false;
+      ctx.drawImage(loupeImg, sx, sy, sw, sh, lX - LR, lY - LR, LR * 2, LR * 2);
+      ctx.imageSmoothingEnabled = true;
+
+      // Crosshair
+      ctx.strokeStyle = 'rgba(241,196,15,0.95)';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(lX - 10, lY); ctx.lineTo(lX + 10, lY);
+      ctx.moveTo(lX, lY - 10); ctx.lineTo(lX, lY + 10);
+      ctx.stroke();
+      ctx.restore();
+
+      // Gold border ring
+      ctx.beginPath();
+      ctx.arc(lX, lY, LR, 0, Math.PI * 2);
+      ctx.strokeStyle = '#F1C40F';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
     $('#zoom-info').textContent = `${(this.zoom * 100).toFixed(0)}%`;
   }
 
@@ -333,6 +616,26 @@ class App {
       this.drawing = true;
       this.drawPts = [this.s2i(e)];
     }
+    if (this.mode === 'fascicle') {
+      const pt = this.s2i(e);
+      const now = Date.now();
+      const dbl = now - this._lastFascClick < 350;
+      this._lastFascClick = now;
+
+      if (dbl && this.fascPts.length >= 3) {
+        // Double-click → close & submit
+        this.submitFascicle([...this.fascPts]);
+        this.fascPts = []; this.fascMouse = null;
+      } else if (this.fascPts.length >= 3 &&
+          Math.hypot(pt.x - this.fascPts[0].x, pt.y - this.fascPts[0].y) < 14 / this.zoom) {
+        // Click near first vertex → close & submit
+        this.submitFascicle([...this.fascPts]);
+        this.fascPts = []; this.fascMouse = null;
+      } else {
+        this.fascPts.push(pt);
+      }
+      this.render();
+    }
   }
 
   onMove(e) {
@@ -344,6 +647,11 @@ class App {
       this.panY += e.clientY - this.lastM.y;
       this.lastM = { x: e.clientX, y: e.clientY };
       this.render();
+      return;
+    }
+    if (this.mode === 'fascicle') {
+      this.fascMouse = pt;
+      if (this.fascPts.length > 0) this.render();
       return;
     }
     if (this.drawing) {
@@ -396,12 +704,24 @@ class App {
   onKey(e, down) {
     if (e.code === 'Space') { this.spaceHeld = down; if (down) e.preventDefault(); return; }
     if (!down) return;
+    // Easter egg — type "marie" anywhere 💙
+    if (e.key.length === 1) {
+      this._keyBuffer = (this._keyBuffer + e.key.toLowerCase()).slice(-5);
+      if (this._keyBuffer === 'marie') { this._keyBuffer = ''; this._marie('💙 Coucou Marie — bonne analyse !'); }
+    }
     if (e.key === '1') this.setMode('navigate');
     if (e.key === '2') this.setMode('delete');
     if (e.key === '3') this.setMode('fiber');
-    if (e.key === 'Escape' && this.mode === 'fiber') {
-      this.fiberStep = 0; this.outerPoly = []; this.drawPts = [];
-      this.drawing = false; this.render(); this.toast('Cancelled', 'info');
+    if (e.key === '4') this.setMode('fascicle');
+    if (e.key === 'Escape') {
+      if (this.mode === 'fiber' && (this.drawing || this.fiberStep > 0)) {
+        this.fiberStep = 0; this.outerPoly = []; this.drawPts = [];
+        this.drawing = false; this.render(); this.toast('Cancelled', 'info');
+      }
+      if (this.mode === 'fascicle' && this.fascPts.length > 0) {
+        this.fascPts = []; this.fascMouse = null;
+        this.render(); this.toast('Cancelled', 'info');
+      }
     }
     if (e.key === 'f' || e.key === 'F') this.fit();
     if (e.key === 'ArrowRight' || e.key === 'ArrowDown') { this.nav(1); e.preventDefault(); }
@@ -504,6 +824,28 @@ class App {
     } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
   }
 
+  async submitFascicle(pts) {
+    if (!this.cur) return;
+    if (pts.length < 3) { this.toast('Draw a larger shape', 'err'); return; }
+    this.showBusy(true, 'Saving fascicle...');
+    try {
+      const r = await fetch(`/api/image/${this.cur}/set-fascicle`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
+      });
+      if (!r.ok) {
+        this.showBusy(false);
+        const err = await r.json();
+        this.toast(err.detail || 'Failed to save fascicle', 'err');
+        return;
+      }
+      this.showBusy(false);
+      this.toast('Fascicle saved — click Recompute to apply', 'ok');
+      this.loadFascicle(this.cur);  // server returns accurate union contour
+    } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
+  }
+
   async recompute() {
     if (!this.cur) return;
     this.toast('Recomputing...', 'info');
@@ -541,7 +883,16 @@ class App {
   }
 
   async recomputeAll() {
-    if (!confirm('Recompute all images? This may take a while but you can keep editing.')) return;
+    const nProcessed = [...this.processedMap.values()].filter(Boolean).length;
+    const minsEst = Math.max(1, Math.round(nProcessed * 1.5));
+    const msg =
+      `Recomputer ${nProcessed} image(s) ?\n\n` +
+      `⏱  Durée estimée : ~${minsEst} min (Cellpose tourne image par image)\n\n` +
+      `✅  L'app reste entièrement utilisable pendant le calcul.\n` +
+      `⚠️  Les caches Cellpose ne sont PAS relancés — seules les morphométries\n` +
+      `    sont recalculées. Pour relancer Cellpose, supprime les caches .npy\n` +
+      `    puis lance segment.py.`;
+    if (!confirm(msg)) return;
     const btn = $('#btn-recompute-all');
     btn.disabled = true;
     try {
@@ -573,11 +924,22 @@ class App {
           clearInterval(iv);
           prog.textContent = '';
           btn.disabled = false;
-          this.toast(`Recompute done -- ${s.done}/${s.total} images`, 'ok');
+          this.toast(`Recompute done — ${s.done}/${s.total} images`, 'ok');
+          if (Math.random() < 0.4) setTimeout(() => this._marie('✨ Marie, tes nerfs sont magnifiques !'), 1200);
           if (this.cur) this.select(this.cur);
         }
       } catch { clearInterval(iv); prog.textContent = ''; btn.disabled = false; }
     }, 2000);
+  }
+
+  /* ── Easter egg 💙 ──────────────────────────────────────────────────── */
+
+  _marie(msg) {
+    const el = document.createElement('div');
+    el.className = 'toast marie-toast';
+    el.textContent = msg;
+    $('#toasts').appendChild(el);
+    setTimeout(() => el.remove(), 5000);
   }
 
   /* ── Toast ───────────────────────────────────────────────────────────── */

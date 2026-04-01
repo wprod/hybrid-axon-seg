@@ -64,4 +64,7 @@ def build_axon_input(img: np.ndarray, outer_labels: np.ndarray) -> np.ndarray:
         minr, minc, maxr, maxc = p.bbox
         crop = _invert_crop(gray[minr:maxr, minc:maxc], p.image)
         result[minr:maxr, minc:maxc][p.image] = crop[p.image]
+    wp = getattr(config, "AXON_INPUT_WHITE_POINT", 255)
+    if wp < 255:
+        result = np.clip(result.astype(np.uint16) * 255 // wp, 0, 255).astype(np.uint8)
     return result

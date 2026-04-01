@@ -213,6 +213,7 @@ def make_overlay(
     df_pass: pd.DataFrame,
     df_rej: pd.DataFrame,
     multicore_labels: set | None = None,
+    fascicle_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build the colour-coded overlay image (returned as H×W×3 uint8 array)."""
     rgb = to_rgb_uint8(img)
@@ -231,7 +232,8 @@ def make_overlay(
         ).astype(np.uint8)
 
     # ── Fascicle boundary — striped overlay drawn first (behind everything) ──
-    fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    if fascicle_mask is None:
+        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
 
     # 2px semi-transparent white perimeter
     fascicle_boundary = find_boundaries(fascicle_mask, mode="outer")

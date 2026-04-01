@@ -62,6 +62,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 def _stems() -> list[str]:
+    """Processed stems only (have Cellpose cache)."""
     if not config.OUTPUT_DIR.exists():
         return []
     return sorted(
@@ -69,6 +70,18 @@ def _stems() -> list[str]:
         for d in config.OUTPUT_DIR.iterdir()
         if d.is_dir() and (d / f"{d.name}_cellpose_outer.npy").exists()
     )
+
+
+def _raw_image_paths() -> dict[str, Path]:
+    """Map stem → raw image path for every image in INPUT_DIR."""
+    result: dict[str, Path] = {}
+    _EXTS = {".tif", ".tiff", ".png"}
+    if not config.INPUT_DIR.exists():
+        return result
+    for p in sorted(config.INPUT_DIR.rglob("*")):
+        if p.suffix.lower() in _EXTS and p.is_file():
+            result[clean_stem(p)] = p
+    return result
 
 
 def _out(stem: str) -> Path:
@@ -111,9 +124,11 @@ def _load_outer(stem: str) -> np.ndarray:
         dist = distance_transform_edt(~border)
         outer = (outer * (dist > config.OUTER_ERODE_PX)).astype(outer.dtype)
 
-    # Remove satellite fibers (low local neighbour density)
-    satellites = find_satellite_labels(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
-    outer = _remove_labels(outer, satellites)
+    # Remove satellite fibers only when no manual fascicle mask exists (mirrors segment.py)
+    fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
+    if not fascicle_edited.exists():
+        satellites = find_satellite_labels(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        outer = _remove_labels(outer, satellites)
 
     return outer
 
@@ -141,6 +156,14 @@ def _backup_outer(stem: str) -> None:
     if not edited.exists():
         outer = _load_outer(stem)  # applies erosion from cache
         np.save(str(edited), outer)
+
+
+def _load_fascicle_mask(stem: str, outer: np.ndarray) -> np.ndarray:
+    """Load fascicle mask — user-edited version if it exists, else auto-computed."""
+    edited = _out(stem) / f"{stem}_fascicle_mask_edited.npy"
+    if edited.exists():
+        return np.load(str(edited))
+    return build_fascicle_mask(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
 
 
 def _edits_path(stem: str) -> Path:
@@ -218,25 +241,52 @@ def index():
 
 @app.get("/api/images")
 def list_images():
+    processed_set = set(_stems())
+    raw_paths = _raw_image_paths()
+    all_stems = sorted(processed_set | set(raw_paths.keys()))
+
     images = []
-    for stem in _stems():
+    for stem in all_stems:
         d = config.OUTPUT_DIR / stem
-        modified = (d / f"{stem}_axon_inner_original.npy").exists() or (
-            d / f"{stem}_outer_edited.npy"
-        ).exists()
-        edits = _load_edits(stem)
-        n_edits = len(edits.get("deleted", [])) + len(edits.get("added", []))
+        processed = stem in processed_set
+        modified = d.exists() and (
+            (d / f"{stem}_axon_inner_original.npy").exists()
+            or (d / f"{stem}_outer_edited.npy").exists()
+            or (d / f"{stem}_fascicle_mask_edited.npy").exists()
+        )
+        n_edits = 0
         n_axons = 0
-        agg_path = d / f"{stem}_aggregate.csv"
-        if agg_path.exists():
-            agg = pd.read_csv(agg_path)
-            if "n_axons" in agg.columns:
-                n_axons = int(agg["n_axons"].iloc[0])
-            else:
-                morph = d / f"{stem}_morphometrics.csv"
-                if morph.exists():
-                    n_axons = len(pd.read_csv(morph))
-        images.append({"stem": stem, "modified": modified, "n_edits": n_edits, "n_axons": n_axons})
+        if processed and d.exists():
+            edits = _load_edits(stem)
+            n_edits = len(edits.get("deleted", [])) + len(edits.get("added", []))
+            agg_path = d / f"{stem}_aggregate.csv"
+            if agg_path.exists():
+                agg = pd.read_csv(agg_path)
+                if "n_axons" in agg.columns:
+                    n_axons = int(agg["n_axons"].iloc[0])
+                else:
+                    morph = d / f"{stem}_morphometrics.csv"
+                    if morph.exists():
+                        n_axons = len(pd.read_csv(morph))
+        # Needs recompute: edits pending since last morphometrics run
+        edits_path = d / f"{stem}_edits.json"
+        morph_path = d / f"{stem}_morphometrics.csv"
+        needs_resegment = (
+            processed
+            and edits_path.exists()
+            and n_edits > 0
+            and (not morph_path.exists() or edits_path.stat().st_mtime > morph_path.stat().st_mtime)
+        )
+        images.append(
+            {
+                "stem": stem,
+                "processed": processed,
+                "modified": modified,
+                "n_edits": n_edits,
+                "n_axons": n_axons,
+                "needs_resegment": needs_resegment,
+            }
+        )
     return images
 
 
@@ -273,6 +323,59 @@ def get_gratio_map(stem: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p, media_type="image/png")
+
+
+@app.post("/api/image/{stem}/clear-fascicle")
+def clear_fascicle(stem: str):
+    """Delete the edited fascicle mask."""
+    mask_path = config.OUTPUT_DIR / stem / f"{stem}_fascicle_mask_edited.npy"
+    if mask_path.exists():
+        mask_path.unlink()
+    return {"status": "ok"}
+
+
+@app.get("/api/image/{stem}/fascicle")
+def get_fascicle_contour(stem: str, t: int = 0):
+    """Return the saved fascicle boundary as a downsampled polygon [[x,y],…]."""
+    from skimage.measure import find_contours
+
+    mask_path = config.OUTPUT_DIR / stem / f"{stem}_fascicle_mask_edited.npy"
+    if not mask_path.exists():
+        return {"points": None}
+
+    mask = np.load(str(mask_path))
+    contours = find_contours(mask.astype(np.float32), 0.5)
+    if not contours:
+        return {"contours": []}
+
+    result = []
+    for contour in sorted(contours, key=len, reverse=True):
+        if len(contour) < 40:  # skip tiny edge artifacts
+            continue
+        step = max(1, len(contour) // 300)
+        result.append([[int(c[1]), int(c[0])] for c in contour[::step]])
+    return {"contours": result if result else []}
+
+
+@app.get("/api/image/{stem}/raw")
+def get_raw(stem: str):
+    """Serve the raw input image as PNG (cached). Works for unprocessed images too."""
+    from utils import to_rgb_uint8
+
+    d = config.OUTPUT_DIR / stem
+    d.mkdir(parents=True, exist_ok=True)
+    png_cache = d / f"{stem}_raw.png"
+
+    if not png_cache.exists():
+        raw_path = _find_raw(stem)
+        if raw_path is None:
+            raise HTTPException(404, f"Raw image not found for '{stem}'")
+        img = io.imread(str(raw_path))
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        io.imsave(str(png_cache), to_rgb_uint8(img), check_contrast=False)
+
+    return FileResponse(str(png_cache), media_type="image/png")
 
 
 # ── Image info ───────────────────────────────────────────────────────────────
@@ -485,7 +588,84 @@ def add_fiber(stem: str, req: FiberReq):
     return {"added": new_label, "x": cx, "y": cy, "refreshed": refreshed}
 
 
+# ── Fascicle delineation ─────────────────────────────────────────────────────
+
+
+class FascicleReq(BaseModel):
+    points: list[list[int]]
+
+
+@app.post("/api/image/{stem}/set-fascicle")
+def set_fascicle(stem: str, req: FascicleReq):
+    """Rasterise a user-drawn polygon → save as edited fascicle mask.
+    Works for both processed and unprocessed (raw) images.
+    """
+    from skimage.draw import polygon as draw_polygon
+
+    if len(req.points) < 3:
+        raise HTTPException(400, "Need at least 3 points")
+
+    # Create output dir for unprocessed images
+    d = config.OUTPUT_DIR / stem
+    d.mkdir(parents=True, exist_ok=True)
+
+    # Resolve image shape: Cellpose cache if available, else raw image
+    outer_cache = d / f"{stem}_cellpose_outer.npy"
+    old_cache = d / f"{stem}_cellpose.npy"
+    if outer_cache.exists():
+        shape = np.load(str(outer_cache), mmap_mode="r").shape
+    elif old_cache.exists():
+        shape = np.load(str(old_cache), mmap_mode="r").shape
+    else:
+        raw_path = _find_raw(stem)
+        if raw_path is None:
+            raise HTTPException(404, f"Raw image not found for '{stem}'")
+        img = io.imread(str(raw_path))
+        shape = img.shape[:2]
+
+    xs = [p[0] for p in req.points]
+    ys = [p[1] for p in req.points]
+    rr, cc = draw_polygon(ys, xs, shape=shape)
+    mask = np.zeros(shape, dtype=bool)
+    if len(rr) > 0:
+        mask[rr, cc] = True
+
+    # Union with existing mask (supports multi-fascicle nerves)
+    existing = d / f"{stem}_fascicle_mask_edited.npy"
+    if existing.exists():
+        prev = np.load(str(existing))
+        if prev.shape == mask.shape:
+            mask = mask | prev
+
+    np.save(str(d / f"{stem}_fascicle_mask_edited.npy"), mask)
+    return {"status": "ok", "area_px": int(mask.sum())}
+
+
 # ── Recompute ────────────────────────────────────────────────────────────────
+
+
+def _read_group_timepoint(stem: str) -> tuple[str, str]:
+    """Recover group/timepoint from existing aggregate CSV, or derive from INPUT_DIR folder."""
+    agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
+    if agg_path.exists():
+        row = pd.read_csv(agg_path).iloc[0]
+        g = str(row.get("group", "")) if "group" in row else ""
+        t = str(row.get("timepoint", "")) if "timepoint" in row else ""
+        if g or t:
+            return g, t
+    # Derive from INPUT_DIR folder structure (same logic as segment.py _parse_folder)
+    import re
+
+    for p in config.INPUT_DIR.rglob("*"):
+        if p.suffix.lower() in {".tif", ".tiff", ".png"} and clean_stem(p) == stem:
+            parent = p.parent
+            if parent != config.INPUT_DIR:
+                name = parent.name
+                m = re.search(r"(\d+w)\s*$", name.strip())
+                if m:
+                    return name.strip()[: m.start()].strip(), m.group(1)
+            break
+    return "", ""
 
 
 @app.post("/api/image/{stem}/recompute")
@@ -495,6 +675,22 @@ def recompute(stem: str):
     outer = _load_outer(stem)
     inner = _load_inner(stem)
     multicore = _load_multicore(stem)
+
+    # Remove fibers outside manual fascicle boundary (if drawn by user)
+    fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
+    if fascicle_edited.exists():
+        fm = np.load(str(fascicle_edited))
+        outside = {
+            p.label
+            for p in measure.regionprops(outer)
+            if not fm[
+                min(int(p.centroid[0]), fm.shape[0] - 1),
+                min(int(p.centroid[1]), fm.shape[1] - 1),
+            ]
+        }
+        if outside:
+            outer = _remove_labels(outer, outside)
+            inner = _remove_labels(inner, outside)
 
     # Reconstruct axon_assignments from inner_labels
     fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer)}
@@ -515,19 +711,22 @@ def recompute(stem: str):
     n_matched = len(pairs)
     df_pass, df_rej = apply_qc(df_all)
 
-    # Remove low-QC clusters
-    bad_cl = find_low_qc_cluster_labels(
-        outer, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
-    )
-    if bad_cl:
-        outer = _remove_labels(outer, bad_cl)
-        inner = _remove_labels(inner, bad_cl)
-        df_pass = df_pass[~df_pass["_fiber_label"].isin(bad_cl)]
-        df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
+    # Remove low-QC clusters only when no manual fascicle mask (mirrors segment.py)
+    if not fascicle_edited.exists():
+        bad_cl = find_low_qc_cluster_labels(
+            outer, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+        )
+        if bad_cl:
+            outer = _remove_labels(outer, bad_cl)
+            inner = _remove_labels(inner, bad_cl)
+            inner_new = _remove_labels(inner_new, bad_cl)
+            df_pass = df_pass[~df_pass["_fiber_label"].isin(bad_cl)]
+            df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
 
-    # Aggregate stats — build fascicle mask from cleaned labels
-    fascicle_mask = build_fascicle_mask(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    # Aggregate stats — use edited fascicle mask if available, else auto-compute
+    fascicle_mask = _load_fascicle_mask(stem, outer)
     nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
+    group, timepoint = _read_group_timepoint(stem)
 
     if len(df_pass) and nerve_um2:
         total_axon_um2 = df_pass["axon_area"].sum()
@@ -535,6 +734,8 @@ def recompute(stem: str):
         avf = total_axon_um2 / nerve_um2
         mvf = total_myelin_um2 / nerve_um2
         agg = {
+            "group": group,
+            "timepoint": timepoint,
             "n_axons": len(df_pass),
             "nerve_area_mm2": nerve_um2 * 1e-6,
             "total_axon_area_mm2": total_axon_um2 * 1e-6,
@@ -547,6 +748,8 @@ def recompute(stem: str):
         }
     else:
         agg = {
+            "group": group,
+            "timepoint": timepoint,
             "n_axons": 0,
             "nerve_area_mm2": 0.0,
             "total_axon_area_mm2": 0.0,
@@ -574,7 +777,9 @@ def recompute(stem: str):
         img = img[:, :, :3]
 
     n_outer = int(outer.max())
-    overlay = make_overlay(img, outer, inner_new, df_pass, df_rej, multicore)
+    overlay = make_overlay(
+        img, outer, inner_new, df_pass, df_rej, multicore, fascicle_mask=fascicle_mask
+    )
     io.imsave(str(d / f"{stem}_overlay.png"), overlay, check_contrast=False)
 
     numbered = make_numbered(
@@ -605,8 +810,9 @@ def reset_image(stem: str):
     d = _out(stem)
     bak_inner = d / f"{stem}_axon_inner_original.npy"
     edited_outer = d / f"{stem}_outer_edited.npy"
+    fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
 
-    if not bak_inner.exists() and not edited_outer.exists():
+    if not bak_inner.exists() and not edited_outer.exists() and not fascicle_edited.exists():
         return {"status": "no_backup"}
 
     if bak_inner.exists():
@@ -614,6 +820,8 @@ def reset_image(stem: str):
         bak_inner.unlink()
     if edited_outer.exists():
         edited_outer.unlink()
+    if fascicle_edited.exists():
+        fascicle_edited.unlink()
 
     _save_edits(stem, {"deleted": [], "added": []})
     return {"status": "ok"}
@@ -643,6 +851,22 @@ def _batch_recompute_worker(stems: list[str]):
             inner = _load_inner(stem)
             multicore = _load_multicore(stem)
 
+            # Remove fibers outside manual fascicle boundary
+            fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
+            if fascicle_edited.exists():
+                fm = np.load(str(fascicle_edited))
+                outside = {
+                    p.label
+                    for p in measure.regionprops(outer)
+                    if not fm[
+                        min(int(p.centroid[0]), fm.shape[0] - 1),
+                        min(int(p.centroid[1]), fm.shape[1] - 1),
+                    ]
+                }
+                if outside:
+                    outer = _remove_labels(outer, outside)
+                    inner = _remove_labels(inner, outside)
+
             fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer)}
             axon_assignments = {}
             for lbl in np.unique(inner):
@@ -660,16 +884,20 @@ def _batch_recompute_worker(stems: list[str]):
             n_matched = len(pairs)
             df_pass, df_rej = apply_qc(df_all)
 
-            bad_cl = find_low_qc_cluster_labels(
-                outer, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
-            )
-            if bad_cl:
-                outer = _remove_labels(outer, bad_cl)
-                df_pass = df_pass[~df_pass["_fiber_label"].isin(bad_cl)]
-                df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
+            # Remove low-QC clusters only when no manual fascicle mask (mirrors segment.py)
+            if not fascicle_edited.exists():
+                bad_cl = find_low_qc_cluster_labels(
+                    outer, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+                )
+                if bad_cl:
+                    outer = _remove_labels(outer, bad_cl)
+                    inner_new = _remove_labels(inner_new, bad_cl)
+                    df_pass = df_pass[~df_pass["_fiber_label"].isin(bad_cl)]
+                    df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
 
-            fascicle_mask = build_fascicle_mask(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+            fascicle_mask = _load_fascicle_mask(stem, outer)
             nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
+            group, timepoint = _read_group_timepoint(stem)
 
             if len(df_pass) and nerve_um2:
                 total_axon_um2 = df_pass["axon_area"].sum()
@@ -677,6 +905,8 @@ def _batch_recompute_worker(stems: list[str]):
                 avf = total_axon_um2 / nerve_um2
                 mvf = total_myelin_um2 / nerve_um2
                 agg = {
+                    "group": group,
+                    "timepoint": timepoint,
                     "n_axons": len(df_pass),
                     "nerve_area_mm2": nerve_um2 * 1e-6,
                     "total_axon_area_mm2": total_axon_um2 * 1e-6,
@@ -688,20 +918,24 @@ def _batch_recompute_worker(stems: list[str]):
                     "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
                 }
             else:
-                agg = dict.fromkeys(
-                    [
-                        "n_axons",
-                        "nerve_area_mm2",
-                        "total_axon_area_mm2",
-                        "total_myelin_area_mm2",
-                        "nratio",
-                        "gratio_aggr",
-                        "avf",
-                        "mvf",
-                        "axon_density_mm2",
-                    ],
-                    0.0,
-                )
+                agg = {
+                    "group": group,
+                    "timepoint": timepoint,
+                    **dict.fromkeys(
+                        [
+                            "n_axons",
+                            "nerve_area_mm2",
+                            "total_axon_area_mm2",
+                            "total_myelin_area_mm2",
+                            "nratio",
+                            "gratio_aggr",
+                            "avf",
+                            "mvf",
+                            "axon_density_mm2",
+                        ],
+                        0.0,
+                    ),
+                }
 
             pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
             df_pass[pub_cols].to_csv(d / f"{stem}_morphometrics.csv", index=False)
@@ -715,7 +949,9 @@ def _batch_recompute_worker(stems: list[str]):
                 if img.ndim == 3 and img.shape[2] == 4:
                     img = img[:, :, :3]
                 n_outer = int(outer.max())
-                overlay = make_overlay(img, outer, inner_new, df_pass, df_rej, multicore)
+                overlay = make_overlay(
+                    img, outer, inner_new, df_pass, df_rej, multicore, fascicle_mask=fascicle_mask
+                )
                 io.imsave(str(d / f"{stem}_overlay.png"), overlay, check_contrast=False)
                 numbered = make_numbered(
                     overlay,

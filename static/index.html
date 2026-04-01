@@ -18,12 +18,13 @@
       <button class="mode-btn active" data-mode="navigate">1 Navigate</button>
       <button class="mode-btn" data-mode="delete">2 Delete</button>
       <button class="mode-btn" data-mode="fiber">3 + Fiber</button>
+      <button class="mode-btn" data-mode="fascicle">4 Fascicle</button>
     </div>
     <span class="sep"></span>
     <div class="toolbar">
       <button id="btn-recompute" class="action green">Recompute</button>
       <button id="btn-reset" class="action amber">Reset</button>
-      <button id="btn-recompute-all" class="action blue">Recompute All</button>
+      <button id="btn-recompute-all" class="action blue" title="Recompute morphometrics for all processed images (background — app stays usable)">Recompute All</button>
       <span id="batch-progress" class="batch-progress"></span>
     </div>
     <span class="sep"></span>
@@ -33,6 +34,12 @@
       <button class="view-btn" data-view="gratio_map" title="Open G-ratio map">G-ratio</button>
       <button id="btn-compare" class="action blue" title="Open multi-image comparison">Compare</button>
     </div>
+    <span class="sep"></span>
+    <label class="opacity-ctrl" title="Opacité de l'overlay — glisser pour voir l'image brute">
+      <span>👁</span>
+      <input type="range" id="opacity-slider" min="0" max="100" value="85">
+      <span id="opacity-val">85%</span>
+    </label>
   </header>
 
   <main>
@@ -58,20 +65,26 @@
     <aside id="panel">
       <h3>Clinician Metrics</h3>
       <table id="tbl-metrics"><tbody></tbody></table>
+      <div id="fascicle-panel" class="mt hidden">
+        <h3>Fascicle <span id="fasc-badge" class="badge" style="background:#F1C40F;color:#000">edited</span></h3>
+        <button id="btn-clear-fasc" class="action amber" style="width:100%;margin-top:6px">✕ Clear fascicle</button>
+      </div>
       <h3 class="mt">Segmentation</h3>
       <table id="tbl-seg"><tbody></tbody></table>
       <div id="shortcuts" class="mt">
         <h3>Shortcuts</h3>
-        <div class="sc">1/2/3 &mdash; mode</div>
+        <div class="sc">1/2/3/4 &mdash; mode</div>
         <div class="sc">Left/Right &mdash; prev/next</div>
         <div class="sc">F &mdash; fit to view</div>
         <div class="sc">Scroll &mdash; zoom</div>
         <div class="sc">Right-drag / Space+drag &mdash; pan</div>
+        <div class="sc">Esc &mdash; cancel draw</div>
+        <div class="sc" style="margin-top:6px;color:#F1C40F">4 Fascicle: click points,<br>close = 1st pt or dbl-click</div>
       </div>
     </aside>
   </main>
 
   <div id="toasts"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=3"></script>
 </body>
 </html>

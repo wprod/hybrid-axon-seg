@@ -83,12 +83,48 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     if not cache_outer.exists() and old_cache.exists():
         cache_outer = old_cache  # backwards-compat
 
+    fascicle_pre = out_dir / f"{stem}_fascicle_mask_edited.npy"
+    has_fascicle = fascicle_pre.exists()
+
+    # If fascicle mask is newer than Cellpose cache → invalidate both caches
+    # so Cellpose re-runs restricted to the fascicle boundary
+    if (
+        has_fascicle
+        and cache_outer.exists()
+        and fascicle_pre.stat().st_mtime > cache_outer.stat().st_mtime
+    ):
+        print("       fascicle mask updated — clearing Cellpose & axon caches")
+        cache_outer.unlink()
+        for _stale in (
+            out_dir / f"{stem}_axon_inner.npy",
+            out_dir / f"{stem}_axon_input.png",
+        ):
+            if _stale.exists():
+                _stale.unlink()
+
     if cache_outer.exists():
         print("  [1/2] Cellpose (fibers) — loading from cache…")
         outer_labels = np.load(str(cache_outer))
     else:
         print("  [1/2] Cellpose (fibers)…")
-        outer_labels = run_cellpose_fibers(img)
+        img_for_cellpose = img
+        if has_fascicle:
+            fm = np.load(str(fascicle_pre))
+            if fm.shape == img.shape[:2]:
+                print("       restricting to manual fascicle mask…")
+                img_for_cellpose = img.copy()
+                bg = (
+                    255
+                    if img.dtype == np.uint8
+                    else (np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0)
+                )
+                if img_for_cellpose.ndim == 3:
+                    img_for_cellpose[~fm] = bg
+                else:
+                    img_for_cellpose[~fm] = bg
+            else:
+                print(f"       ⚠ fascicle mask shape {fm.shape} ≠ image {img.shape[:2]}, ignored")
+        outer_labels = run_cellpose_fibers(img_for_cellpose)
         np.save(str(out_dir / f"{stem}_cellpose_outer.npy"), outer_labels)
 
     # Erode each fiber mask: remove pixels within OUTER_ERODE_PX of any border
@@ -102,9 +138,10 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         dist = distance_transform_edt(~border)
         outer_labels = (outer_labels * (dist > config.OUTER_ERODE_PX)).astype(outer_labels.dtype)
 
-    # Remove satellite fibers (low local neighbour density)
-    satellites = find_satellite_labels(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
-    outer_labels = _remove_labels(outer_labels, satellites)
+    # Remove satellite fibers — skipped when fascicle mask constrains Cellpose
+    if not has_fascicle:
+        satellites = find_satellite_labels(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        outer_labels = _remove_labels(outer_labels, satellites)
 
     n_outer = int(outer_labels.max())
     print(f"       → {n_outer} fibers")
@@ -157,23 +194,29 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     df_pass, df_rej = apply_qc(df_all)
     print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
 
-    # Remove low-QC clusters (tissue noise with poor axon detection rate)
-    bad_cluster_labels = find_low_qc_cluster_labels(
-        outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
-    )
-    if bad_cluster_labels:
-        outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
-        inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
+    # Remove low-QC clusters — skipped when fascicle mask constrains Cellpose
+    if not has_fascicle:
+        bad_cluster_labels = find_low_qc_cluster_labels(
+            outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+        )
+        if bad_cluster_labels:
+            outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
+            inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
 
-        def keep_fibers(df):
-            return df[~df["_fiber_label"].isin(bad_cluster_labels)]
+            def keep_fibers(df):
+                return df[~df["_fiber_label"].isin(bad_cluster_labels)]
 
-        df_pass = keep_fibers(df_pass)
-        df_rej = keep_fibers(df_rej)
-        print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
+            df_pass = keep_fibers(df_pass)
+            df_rej = keep_fibers(df_rej)
+            print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
 
-    # Build fascicle mask from cleaned labels (for nerve area + viz boundary)
-    fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    # Fascicle mask: use manual if available, else auto-compute from labels
+    if has_fascicle:
+        fascicle_mask = np.load(str(fascicle_pre))
+        if fascicle_mask.shape != outer_labels.shape:
+            fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    else:
+        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
     np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
 
     # Recompute aggregate stats from QC-passed fibers only
@@ -222,7 +265,15 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
 
     # ── Step 5: Visualizations ────────────────────────────────────────────
     print("  Generating visualizations…")
-    overlay = make_overlay(img, outer_labels, inner_labels, df_pass, df_rej, multicore_labels)
+    overlay = make_overlay(
+        img,
+        outer_labels,
+        inner_labels,
+        df_pass,
+        df_rej,
+        multicore_labels,
+        fascicle_mask=fascicle_mask,
+    )
     io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
 
     numbered = make_numbered(
@@ -270,12 +321,29 @@ def main() -> None:
     if not image_tuples:
         sys.exit(f"No images found in {config.INPUT_DIR}")
 
-    print(f"Found {len(image_tuples)} image(s) in {config.INPUT_DIR}\n")
+    # Keep only images that have a manual fascicle mask
+    with_fascicle = [
+        (p, g, t)
+        for p, g, t in image_tuples
+        if (
+            config.OUTPUT_DIR / clean_stem(p) / f"{clean_stem(p)}_fascicle_mask_edited.npy"
+        ).exists()
+    ]
+    skipped = len(image_tuples) - len(with_fascicle)
+    if skipped:
+        print(f"  ↷ {skipped} image(s) without fascicle mask — skipped")
+    if not with_fascicle:
+        sys.exit("No images with a fascicle mask found. Draw fascicle boundaries in the app first.")
+    image_tuples = with_fascicle
+
+    print(f"Processing {len(image_tuples)} image(s) with fascicle mask\n")
     results = []
     for p, group, timepoint in image_tuples:
         stem = clean_stem(p)
         agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
-        if agg_path.exists():
+        fascicle_path = config.OUTPUT_DIR / stem / f"{stem}_fascicle_mask_edited.npy"
+        # Skip only if aggregate is newer than the fascicle mask
+        if agg_path.exists() and agg_path.stat().st_mtime >= fascicle_path.stat().st_mtime:
             print(f"  ↷ {stem}  (already processed, skipping)")
             agg = pd.read_csv(agg_path).iloc[0].to_dict()
             results.append({"image": stem, **agg})

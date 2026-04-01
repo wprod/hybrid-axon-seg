@@ -61,8 +61,10 @@ main{flex:1;display:flex;overflow:hidden}
 .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;border:1px solid transparent}
 .dot.orig{background:var(--muted)}
 .dot.mod{background:var(--amber)}
+.dot.raw{background:var(--muted);opacity:0.35}
 .img-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .img-n{font-size:10px;color:var(--muted)}
+.reseg-badge{font-size:10px;color:var(--amber);flex-shrink:0;line-height:1}
 
 /* ── Viewer ────────────────────────────────────────────────────────────── */
 #viewer{flex:1;position:relative;overflow:hidden;background:#0a0c0f}
@@ -81,6 +83,7 @@ main{flex:1;display:flex;overflow:hidden}
 /* Cursor modes */
 #viewer.mode-delete #canvas{cursor:crosshair}
 #viewer.mode-fiber #canvas{cursor:crosshair}
+#viewer.mode-fascicle #canvas{cursor:crosshair}
 #viewer.mode-navigate #canvas{cursor:grab}
 #viewer.panning #canvas{cursor:grabbing}
 
@@ -99,6 +102,11 @@ main{flex:1;display:flex;overflow:hidden}
 /* ── Batch progress ───────────────────────────────────────────────────── */
 .batch-progress{font-size:11px;color:var(--accent);font-weight:600;white-space:nowrap}
 
+/* ── Opacity slider ────────────────────────────────────────────────────── */
+.opacity-ctrl{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);white-space:nowrap;user-select:none}
+.opacity-ctrl input[type=range]{width:72px;accent-color:var(--accent);cursor:pointer;height:3px}
+#opacity-val{min-width:28px;text-align:right;font-variant-numeric:tabular-nums}
+
 /* ── Toasts ────────────────────────────────────────────────────────────── */
 #toasts{position:fixed;top:14px;right:14px;z-index:999;display:flex;flex-direction:column;gap:6px}
 .toast{padding:8px 14px;border-radius:5px;font-size:12px;font-weight:500;
@@ -106,4 +114,5 @@ main{flex:1;display:flex;overflow:hidden}
 .toast.ok{background:var(--green);color:#000}
 .toast.err{background:var(--red);color:#fff}
 .toast.info{background:var(--accent);color:#000}
+.toast.marie-toast{background:linear-gradient(135deg,#e91e8c,#9c27b0);color:#fff;font-size:13px;letter-spacing:.3px}
 @keyframes tIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}

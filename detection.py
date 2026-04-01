@@ -18,36 +18,46 @@ import config
 
 
 def _clahe_preprocess(img: np.ndarray) -> np.ndarray:
-    """Apply CLAHE on the green channel (or grayscale) to boost local contrast.
+    """Stretch p2-p98 then apply CLAHE to boost contrast before Cellpose.
+
+    Step 1 — global percentile stretch: removes the gray veil by mapping
+             p2→0 and p98→255, making dark myelin and bright axons pop.
+    Step 2 — CLAHE: enhances local gradients so fiber ring patterns are
+             visible even in dense zones.
 
     Works on uint8 or uint16 input; always returns uint8 suitable for Cellpose.
-    Operates channel-by-channel if RGB, otherwise on the single channel.
     """
     from skimage import exposure
     from skimage.util import img_as_ubyte
 
-    # Clip range (tiny percentile for robustness against hot pixels)
-    clip = getattr(config, "CLAHE_CLIP_LIMIT", 0.02)
-    tile = getattr(config, "CLAHE_TILE_SIZE", (64, 64))
+    clip = getattr(config, "CLAHE_CLIP_LIMIT", 0.04)
+    tile = getattr(config, "CLAHE_TILE_SIZE", (16, 16))
+
+    def _process_channel(ch: np.ndarray) -> np.ndarray:
+        # Step 1: percentile stretch
+        plo = getattr(config, "STRETCH_PLOW", 2)
+        phi = getattr(config, "STRETCH_PHIGH", 98)
+        lo, hi = np.percentile(ch, plo), np.percentile(ch, phi)
+        if hi > lo:
+            stretched = np.clip((ch.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+        else:
+            stretched = ch.astype(np.float32) / 255.0
+        # Step 2: CLAHE (optional — skipped if clip_limit == 0)
+        if clip > 0:
+            return img_as_ubyte(
+                np.clip(
+                    exposure.equalize_adapthist(stretched, kernel_size=tile, clip_limit=clip), 0, 1
+                )
+            )
+        return img_as_ubyte(np.clip(stretched, 0, 1))
 
     if img.ndim == 3:
-        out = np.empty_like(img if img.dtype == np.uint8 else img.astype(np.uint8))
+        out = np.empty((img.shape[0], img.shape[1], img.shape[2]), dtype=np.uint8)
         for c in range(img.shape[2]):
-            ch = img[:, :, c]
-            ch_f = ch.astype(np.float32) / (
-                np.iinfo(ch.dtype).max if np.issubdtype(ch.dtype, np.integer) else 1.0
-            )
-            out[:, :, c] = img_as_ubyte(
-                np.clip(exposure.equalize_adapthist(ch_f, kernel_size=tile, clip_limit=clip), 0, 1)
-            )
+            out[:, :, c] = _process_channel(img[:, :, c])
         return out
     else:
-        ch_f = img.astype(np.float32) / (
-            np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0
-        )
-        return img_as_ubyte(
-            np.clip(exposure.equalize_adapthist(ch_f, kernel_size=tile, clip_limit=clip), 0, 1)
-        )
+        return _process_channel(img)
 
 
 def run_cellpose_fibers(img: np.ndarray) -> np.ndarray:
@@ -76,6 +86,7 @@ def run_cellpose_fibers(img: np.ndarray) -> np.ndarray:
         flow_threshold=config.CP_FLOW_THR,
         cellprob_threshold=config.CP_CELLPROB,
         min_size=config.MIN_AXON_SIZE,
+        augment=True,
     )
     return masks
 

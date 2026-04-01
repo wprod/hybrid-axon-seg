@@ -8,13 +8,15 @@ OUTPUT_DIR = Path("output")
 PIXEL_SIZE = 0.09  # µm/px at source resolution
 
 # Cellpose — pass 1 (outer fibers)
-CP_MODEL = "cyto3"
-CP_DIAM_UM = 7.0  # expected fiber diameter (µm)
-CP_FLOW_THR = 0.4
-CP_CELLPROB = 0.0
-CP_CLAHE = False  # apply CLAHE before Cellpose to boost local contrast
-CLAHE_CLIP_LIMIT = 0.02  # CLAHE clip limit (0–1); higher = more aggressive
-CLAHE_TILE_SIZE = (64, 64)  # local tile size for CLAHE kernel
+CP_MODEL = "cpsam"
+CP_DIAM_UM = 5.0
+CP_FLOW_THR = 0.3
+CP_CELLPROB = -1.0
+CP_CLAHE = True  # apply percentile stretch before Cellpose to boost contrast
+CLAHE_CLIP_LIMIT = 0.0  # 0 = stretch only (no CLAHE); >0 = stretch + CLAHE
+CLAHE_TILE_SIZE = (64, 64)  # local tile size for CLAHE kernel (used only if clip_limit > 0)
+STRETCH_PLOW = 2  # low percentile for stretch
+STRETCH_PHIGH = 98  # high percentile for stretch
 
 # Inversion / preprocessing
 MASK_ERODE_PX = 4  # px stripped from fiber boundary before normalization
@@ -24,7 +26,7 @@ AXON_SMOOTH_SIGMA = 1.5  # Gaussian sigma for perimeter smoothing (0 = off)
 AXON_DILATE_PX = 3  # expand axon mask after convex hull (0 = off; convex hull already fills)
 AXON_MIN_MYELIN_PX = 2  # minimum myelin ring thickness (clips axon from fiber edge)
 OUTER_ERODE_PX = 2  # erode fiber mask before morphometrics (shrinks fiber → less myelin)
-AXON_INPUT_WHITE_POINT = 160  # clip white point of axon_input (pixels above → 255); 255 = off
+AXON_INPUT_WHITE_POINT = 255  # clip white point of axon_input (pixels above → 255); 255 = off
 
 # QC filters  (permissive by default — clinician adjusts)
 MIN_GRATIO = 0.3

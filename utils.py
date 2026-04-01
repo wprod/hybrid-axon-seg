@@ -1,7 +1,13 @@
 """utils.py — Small shared helpers (image conversion, font loading, stem cleaning)."""
 
+from __future__ import annotations
+
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 import numpy as np
 from PIL import ImageFont
@@ -86,8 +92,8 @@ def find_satellite_labels(
 
 def find_low_qc_cluster_labels(
     outer_labels: np.ndarray,
-    df_pass: "pd.DataFrame",
-    df_rej: "pd.DataFrame",
+    df_pass: pd.DataFrame,
+    df_rej: pd.DataFrame,
     pixel_size: float,
     fiber_diam_um: float,
 ) -> set[int]:
@@ -131,7 +137,9 @@ def find_low_qc_cluster_labels(
         cx = min(int(p.centroid[1]) // scale, sw - 1)
         centroid_map[cy, cx] = True
 
-    link_r = max(1, int(round(fiber_diam_px * 0.75 / scale)))
+    # Gap tolerance ≈ 1.5 × fiber_diam: bridges thin internal septa while
+    # leaving real satellite gaps (typically >> 3 × fiber_diam) separate.
+    link_r = max(1, int(round(fiber_diam_px * 1.5 / scale)))
     dilated = morphology.binary_dilation(centroid_map, morphology.disk(link_r))
     labeled_cc = _measure.label(dilated)
 
