@@ -24,7 +24,12 @@ FADE_PX = 8  # px of inward fade from the eroded edge
 MIN_AXON_SIZE = 40  # min axon blob area (px²)
 AXON_SMOOTH_SIGMA = 1.5  # Gaussian sigma for perimeter smoothing (0 = off)
 AXON_DILATE_PX = 3  # expand axon mask after convex hull (0 = off; convex hull already fills)
-AXON_MIN_MYELIN_PX = 2  # minimum myelin ring thickness (clips axon from fiber edge)
+AXON_OPEN_PX = (
+    2  # morphological opening radius after dilation: removes thin notches/protrusions (0 = off)
+)
+AXON_MIN_MYELIN_PX = 2  # hard floor: axon must be ≥ this many px from fiber edge
+AXON_MIN_MYELIN_FRAC = 0.30  # adaptive floor: axon must also be ≥ frac×outer_radius from edge
+# (larger fibers → thicker myelin → larger minimum gap)
 OUTER_ERODE_PX = 2  # erode fiber mask before morphometrics (shrinks fiber → less myelin)
 AXON_INPUT_WHITE_POINT = 255  # clip white point of axon_input (pixels above → 255); 255 = off
 

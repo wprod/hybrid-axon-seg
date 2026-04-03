@@ -25,7 +25,7 @@ from pydantic import BaseModel
 from skimage import io, measure
 
 import config
-from morphometrics import process_fibers
+from morphometrics import compute_aggregate, process_fibers
 from qc import apply_qc
 from segment import _remove_labels
 from utils import build_fascicle_mask, clean_stem, find_low_qc_cluster_labels, find_satellite_labels
@@ -99,16 +99,9 @@ def _find_raw(stem: str) -> Path | None:
     return None
 
 
-def _load_outer(stem: str) -> np.ndarray:
-    """Load outer labels — user-edited version if it exists, else Cellpose + erosion."""
+def _load_outer_base(stem: str) -> np.ndarray:
+    """Load outer labels from Cellpose cache + erosion + satellite removal."""
     d = _out(stem)
-
-    # User-edited post-erosion labels take precedence
-    edited = d / f"{stem}_outer_edited.npy"
-    if edited.exists():
-        return np.load(str(edited))
-
-    # Original: Cellpose cache + erosion + cluster (mirrors segment.py)
     cache = d / f"{stem}_cellpose_outer.npy"
     old = d / f"{stem}_cellpose.npy"
     if not cache.exists() and old.exists():
@@ -124,13 +117,30 @@ def _load_outer(stem: str) -> np.ndarray:
         dist = distance_transform_edt(~border)
         outer = (outer * (dist > config.OUTER_ERODE_PX)).astype(outer.dtype)
 
-    # Remove satellite fibers only when no manual fascicle mask exists (mirrors segment.py)
     fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
     if not fascicle_edited.exists():
         satellites = find_satellite_labels(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
         outer = _remove_labels(outer, satellites)
 
     return outer
+
+
+def _load_outer(stem: str) -> np.ndarray:
+    """Load outer labels — gt > edited > cellpose base.
+
+    Returns the most complete label map available:
+    - ``_outer_gt.npy``     ground truth (clinician-validated, includes additions)
+    - ``_outer_edited.npy`` corrected prediction (deletions/modifications only)
+    - Cellpose cache        raw model output + erosion + satellite removal
+    """
+    d = _out(stem)
+    gt = d / f"{stem}_outer_gt.npy"
+    if gt.exists():
+        return np.load(str(gt))
+    edited = d / f"{stem}_outer_edited.npy"
+    if edited.exists():
+        return np.load(str(edited))
+    return _load_outer_base(stem)
 
 
 def _load_inner(stem: str) -> np.ndarray:
@@ -150,12 +160,23 @@ def _backup_inner(stem: str) -> None:
 
 
 def _backup_outer(stem: str) -> None:
-    """Save current outer labels as _outer_edited.npy if not already edited."""
+    """Ensure both _outer_edited.npy and _outer_gt.npy exist on first edit.
+
+    - ``_outer_edited.npy`` — corrected prediction (no manual additions)
+    - ``_outer_gt.npy``     — ground truth (includes manual additions)
+
+    On first call, both are bootstrapped from the Cellpose base.  If only
+    ``_outer_edited.npy`` exists (legacy data), ``_outer_gt.npy`` is copied
+    from it so existing edits (including any legacy additions) are preserved.
+    """
     d = _out(stem)
     edited = d / f"{stem}_outer_edited.npy"
+    gt = d / f"{stem}_outer_gt.npy"
     if not edited.exists():
-        outer = _load_outer(stem)  # applies erosion from cache
-        np.save(str(edited), outer)
+        base = _load_outer_base(stem)
+        np.save(str(edited), base)
+    if not gt.exists():
+        shutil.copy2(str(edited), str(gt))
 
 
 def _load_fascicle_mask(stem: str, outer: np.ndarray) -> np.ndarray:
@@ -164,6 +185,15 @@ def _load_fascicle_mask(stem: str, outer: np.ndarray) -> np.ndarray:
     if edited.exists():
         return np.load(str(edited))
     return build_fascicle_mask(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+
+
+def _load_exclusion_mask(stem: str, shape: tuple) -> np.ndarray | None:
+    """Load exclusion mask if it exists and matches shape."""
+    excl_path = config.OUTPUT_DIR / stem / f"{stem}_exclusion_mask.npy"
+    if not excl_path.exists():
+        return None
+    mask = np.load(str(excl_path))
+    return mask if mask.shape == shape else None
 
 
 def _edits_path(stem: str) -> Path:
@@ -252,6 +282,7 @@ def list_images():
         modified = d.exists() and (
             (d / f"{stem}_axon_inner_original.npy").exists()
             or (d / f"{stem}_outer_edited.npy").exists()
+            or (d / f"{stem}_outer_gt.npy").exists()
             or (d / f"{stem}_fascicle_mask_edited.npy").exists()
         )
         n_edits = 0
@@ -299,6 +330,13 @@ def get_overlay(stem: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p, media_type="image/png")
+
+
+@app.post("/api/image/{stem}/rebuild-overlay")
+def rebuild_overlay(stem: str):
+    """Regenerate overlay PNG after deferred (refresh=false) edits."""
+    _fast_overlay(stem)
+    return {"status": "ok"}
 
 
 @app.get("/api/image/{stem}/numbered")
@@ -450,45 +488,49 @@ def identify(stem: str, pt: PointReq):
 
 
 @app.post("/api/image/{stem}/delete")
-def delete_axon(stem: str, pt: PointReq):
+def delete_axon(stem: str, pt: PointReq, refresh: bool = True):
+    _backup_inner(stem)
+    _backup_outer(stem)
+    d = _out(stem)
+
     inner = _load_inner(stem)
-    outer = _load_outer(stem)
+    gt = np.load(str(d / f"{stem}_outer_gt.npy"))
     y, x = pt.y, pt.x
 
     if not (0 <= y < inner.shape[0] and 0 <= x < inner.shape[1]):
         raise HTTPException(400, "Coordinates out of bounds")
 
-    # Find label at click — try inner first, then outer
+    # Find label at click — try inner first, then gt (complete picture)
     label = int(inner[y, x])
     if label == 0:
-        fiber = int(outer[y, x])
+        fiber = int(gt[y, x])
         if fiber > 0:
             label = fiber
     if label == 0:
         raise HTTPException(404, "No fiber found at this position")
 
-    # Centroid before deletion (from outer since it's the larger region)
-    ys, xs = np.where(outer == label)
+    # Centroid before deletion
+    ys, xs = np.where(gt == label)
     if len(ys) == 0:
         ys, xs = np.where(inner == label)
     cx, cy = int(xs.mean()), int(ys.mean())
 
-    # Delete fiber from BOTH inner (axon) and outer (myelin)
-    _backup_inner(stem)
-    _backup_outer(stem)
-    d = _out(stem)
-
+    # Delete from inner + both outer files (edited & gt)
     inner[inner == label] = 0
     np.save(str(d / f"{stem}_axon_inner.npy"), inner)
 
-    outer[outer == label] = 0
-    np.save(str(d / f"{stem}_outer_edited.npy"), outer)
+    gt[gt == label] = 0
+    np.save(str(d / f"{stem}_outer_gt.npy"), gt)
+
+    edited = np.load(str(d / f"{stem}_outer_edited.npy"))
+    edited[edited == label] = 0
+    np.save(str(d / f"{stem}_outer_edited.npy"), edited)
 
     edits = _load_edits(stem)
     edits["deleted"].append({"label": int(label), "x": cx, "y": cy})
     _save_edits(stem, edits)
 
-    refreshed = _fast_overlay(stem)
+    refreshed = _fast_overlay(stem) if refresh else False
     return {"deleted": label, "x": cx, "y": cy, "refreshed": refreshed}
 
 
@@ -497,7 +539,7 @@ class PolyReq(BaseModel):
 
 
 @app.post("/api/image/{stem}/add")
-def add_axon(stem: str, poly: PolyReq):
+def add_axon(stem: str, poly: PolyReq, refresh: bool = True):
     from skimage.draw import polygon as draw_polygon
 
     inner = _load_inner(stem)
@@ -532,7 +574,7 @@ def add_axon(stem: str, poly: PolyReq):
     edits["added"].append({"label": int(fiber_label), "x": cx, "y": cy})
     _save_edits(stem, edits)
 
-    refreshed = _fast_overlay(stem)
+    refreshed = _fast_overlay(stem) if refresh else False
     return {"added": fiber_label, "x": cx, "y": cy, "refreshed": refreshed}
 
 
@@ -542,20 +584,30 @@ class FiberReq(BaseModel):
 
 
 @app.post("/api/image/{stem}/add-fiber")
-def add_fiber(stem: str, req: FiberReq):
-    """Add a brand-new fiber: outer (myelin boundary) + inner (axon)."""
-    from skimage.draw import polygon as draw_polygon
+def add_fiber(stem: str, req: FiberReq, refresh: bool = True):
+    """Add a brand-new fiber: outer (myelin boundary) + inner (axon).
 
-    outer = _load_outer(stem)
-    inner = _load_inner(stem)
+    The outer boundary is written to ``_outer_gt.npy`` only (ground truth)
+    — NOT to ``_outer_edited.npy`` (corrected prediction).  This lets us
+    distinguish model false-negatives from true-positives for fine-tuning.
+    """
+    from skimage.draw import polygon as draw_polygon
 
     if len(req.outer_points) < 3 or len(req.inner_points) < 3:
         raise HTTPException(400, "Both polygons need at least 3 points")
 
+    _backup_inner(stem)
+    _backup_outer(stem)
+    d = _out(stem)
+
+    gt = np.load(str(d / f"{stem}_outer_gt.npy"))
+    edited = np.load(str(d / f"{stem}_outer_edited.npy"))
+    inner = _load_inner(stem)
+
     # Rasterise outer polygon
     o_xs = [p[0] for p in req.outer_points]
     o_ys = [p[1] for p in req.outer_points]
-    o_rr, o_cc = draw_polygon(o_ys, o_xs, shape=outer.shape)
+    o_rr, o_cc = draw_polygon(o_ys, o_xs, shape=gt.shape)
     if len(o_rr) == 0:
         raise HTTPException(400, "Outer polygon is empty or out of bounds")
 
@@ -566,17 +618,14 @@ def add_fiber(stem: str, req: FiberReq):
     if len(i_rr) == 0:
         raise HTTPException(400, "Inner polygon is empty or out of bounds")
 
-    new_label = max(int(outer.max()), int(inner.max())) + 1
+    # Label unique across both files
+    new_label = max(int(edited.max()), int(gt.max()), int(inner.max())) + 1
 
-    # Backup inner (original .npy kept as safety net)
-    _backup_inner(stem)
+    # Outer goes to GT only — this is a manual addition (model false-negative)
+    gt[o_rr, o_cc] = new_label
+    np.save(str(d / f"{stem}_outer_gt.npy"), gt)
 
-    d = _out(stem)
-    outer[o_rr, o_cc] = new_label
     inner[i_rr, i_cc] = new_label
-
-    # Save outer as post-erosion edited version (never touches cellpose cache)
-    np.save(str(d / f"{stem}_outer_edited.npy"), outer)
     np.save(str(d / f"{stem}_axon_inner.npy"), inner)
 
     cx, cy = int(np.mean(i_xs)), int(np.mean(i_ys))
@@ -584,7 +633,7 @@ def add_fiber(stem: str, req: FiberReq):
     edits["added"].append({"label": int(new_label), "x": cx, "y": cy, "type": "fiber"})
     _save_edits(stem, edits)
 
-    refreshed = _fast_overlay(stem)
+    refreshed = _fast_overlay(stem) if refresh else False
     return {"added": new_label, "x": cx, "y": cy, "refreshed": refreshed}
 
 
@@ -639,6 +688,155 @@ def set_fascicle(stem: str, req: FascicleReq):
 
     np.save(str(d / f"{stem}_fascicle_mask_edited.npy"), mask)
     return {"status": "ok", "area_px": int(mask.sum())}
+
+
+@app.post("/api/image/{stem}/paint-outer")
+def paint_outer(stem: str, poly: PolyReq, refresh: bool = True):
+    """Paint a new outer-fiber region from a freehand lasso polygon.
+
+    Written to ``_outer_gt.npy`` only (manual addition = model false-negative).
+    """
+    from skimage.draw import polygon as draw_polygon
+
+    if len(poly.points) < 3:
+        raise HTTPException(400, "Need at least 3 points")
+
+    _backup_outer(stem)
+    d = _out(stem)
+
+    gt = np.load(str(d / f"{stem}_outer_gt.npy"))
+    edited = np.load(str(d / f"{stem}_outer_edited.npy"))
+    inner = _load_inner(stem)
+
+    xs = [p[0] for p in poly.points]
+    ys = [p[1] for p in poly.points]
+    rr, cc = draw_polygon(ys, xs, shape=gt.shape)
+    if len(rr) == 0:
+        raise HTTPException(400, "Polygon is empty or out of bounds")
+
+    new_label = max(int(edited.max()), int(gt.max()), int(inner.max())) + 1
+
+    gt[rr, cc] = new_label
+    np.save(str(d / f"{stem}_outer_gt.npy"), gt)
+
+    cx, cy = int(np.mean(xs)), int(np.mean(ys))
+    edits = _load_edits(stem)
+    edits["added"].append({"label": int(new_label), "x": cx, "y": cy, "type": "outer"})
+    _save_edits(stem, edits)
+
+    refreshed = _fast_overlay(stem) if refresh else False
+    return {"added": new_label, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/image/{stem}/erase-outer")
+def erase_outer(stem: str, poly: PolyReq, refresh: bool = True):
+    """Zero out outer (and inner) mask within a freehand lasso polygon."""
+    from skimage.draw import polygon as draw_polygon
+
+    if len(poly.points) < 3:
+        raise HTTPException(400, "Need at least 3 points")
+
+    _backup_inner(stem)
+    _backup_outer(stem)
+    d = _out(stem)
+
+    gt = np.load(str(d / f"{stem}_outer_gt.npy"))
+    edited = np.load(str(d / f"{stem}_outer_edited.npy"))
+    inner = _load_inner(stem)
+
+    xs = [p[0] for p in poly.points]
+    ys = [p[1] for p in poly.points]
+    rr, cc = draw_polygon(ys, xs, shape=gt.shape)
+    if len(rr) == 0:
+        raise HTTPException(400, "Polygon is empty or out of bounds")
+
+    gt[rr, cc] = 0
+    edited[rr, cc] = 0
+    inner[rr, cc] = 0
+    np.save(str(d / f"{stem}_outer_gt.npy"), gt)
+    np.save(str(d / f"{stem}_outer_edited.npy"), edited)
+    np.save(str(d / f"{stem}_axon_inner.npy"), inner)
+
+    cx, cy = int(np.mean(xs)), int(np.mean(ys))
+    edits = _load_edits(stem)
+    edits["deleted"].append({"label": -1, "x": cx, "y": cy, "type": "erase"})
+    _save_edits(stem, edits)
+
+    refreshed = _fast_overlay(stem) if refresh else False
+    return {"erased": True, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/image/{stem}/set-exclusion")
+def set_exclusion(stem: str, req: FascicleReq):
+    """Rasterise polygon → save as exclusion zone mask (unioned with existing)."""
+    from skimage.draw import polygon as draw_polygon
+
+    if len(req.points) < 3:
+        raise HTTPException(400, "Need at least 3 points")
+
+    d = config.OUTPUT_DIR / stem
+    d.mkdir(parents=True, exist_ok=True)
+
+    outer_cache = d / f"{stem}_cellpose_outer.npy"
+    old_cache = d / f"{stem}_cellpose.npy"
+    if outer_cache.exists():
+        shape = np.load(str(outer_cache), mmap_mode="r").shape
+    elif old_cache.exists():
+        shape = np.load(str(old_cache), mmap_mode="r").shape
+    else:
+        raw_path = _find_raw(stem)
+        if raw_path is None:
+            raise HTTPException(404, f"Raw image not found for '{stem}'")
+        img = io.imread(str(raw_path))
+        shape = img.shape[:2]
+
+    xs = [p[0] for p in req.points]
+    ys = [p[1] for p in req.points]
+    rr, cc = draw_polygon(ys, xs, shape=shape)
+    mask = np.zeros(shape, dtype=bool)
+    if len(rr) > 0:
+        mask[rr, cc] = True
+
+    excl_path = d / f"{stem}_exclusion_mask.npy"
+    if excl_path.exists():
+        prev = np.load(str(excl_path))
+        if prev.shape == mask.shape:
+            mask = mask | prev
+
+    np.save(str(excl_path), mask)
+    return {"status": "ok", "area_px": int(mask.sum())}
+
+
+@app.get("/api/image/{stem}/exclusion")
+def get_exclusion(stem: str, t: int = 0):
+    """Return saved exclusion zone as polygon contours [[x,y],…]."""
+    from skimage.measure import find_contours
+
+    excl_path = config.OUTPUT_DIR / stem / f"{stem}_exclusion_mask.npy"
+    if not excl_path.exists():
+        return {"contours": []}
+
+    mask = np.load(str(excl_path))
+    contours = find_contours(mask.astype(np.float32), 0.5)
+    if not contours:
+        return {"contours": []}
+
+    result = []
+    for contour in sorted(contours, key=len, reverse=True):
+        if len(contour) < 10:
+            continue
+        step = max(1, len(contour) // 300)
+        result.append([[int(c[1]), int(c[0])] for c in contour[::step]])
+    return {"contours": result}
+
+
+@app.post("/api/image/{stem}/clear-exclusion")
+def clear_exclusion(stem: str):
+    """Delete the exclusion mask."""
+    excl_path = config.OUTPUT_DIR / stem / f"{stem}_exclusion_mask.npy"
+    if excl_path.exists():
+        excl_path.unlink()
+    return {"status": "ok"}
 
 
 # ── Recompute ────────────────────────────────────────────────────────────────
@@ -705,7 +903,7 @@ def recompute(stem: str):
         axon_assignments[int(lbl)] = (minr, minc, inner[minr:maxr, minc:maxc] == lbl)
 
     # Morphometrics + QC
-    inner_new, pairs, df_all, index_image, _ = process_fibers(
+    inner_new, pairs, df_all, index_image = process_fibers(
         outer, axon_assignments, config.PIXEL_SIZE
     )
     n_matched = len(pairs)
@@ -723,43 +921,19 @@ def recompute(stem: str):
             df_pass = df_pass[~df_pass["_fiber_label"].isin(bad_cl)]
             df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
 
-    # Aggregate stats — use edited fascicle mask if available, else auto-compute
     fascicle_mask = _load_fascicle_mask(stem, outer)
-    nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
+    excl_mask = _load_exclusion_mask(stem, fascicle_mask.shape)
     group, timepoint = _read_group_timepoint(stem)
 
-    if len(df_pass) and nerve_um2:
-        total_axon_um2 = df_pass["axon_area"].sum()
-        total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
-        avf = total_axon_um2 / nerve_um2
-        mvf = total_myelin_um2 / nerve_um2
-        agg = {
-            "group": group,
-            "timepoint": timepoint,
-            "n_axons": len(df_pass),
-            "nerve_area_mm2": nerve_um2 * 1e-6,
-            "total_axon_area_mm2": total_axon_um2 * 1e-6,
-            "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
-            "nratio": avf + mvf,
-            "gratio_aggr": df_pass["gratio"].mean(),
-            "avf": avf,
-            "mvf": mvf,
-            "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
-        }
-    else:
-        agg = {
-            "group": group,
-            "timepoint": timepoint,
-            "n_axons": 0,
-            "nerve_area_mm2": 0.0,
-            "total_axon_area_mm2": 0.0,
-            "total_myelin_area_mm2": 0.0,
-            "nratio": 0.0,
-            "gratio_aggr": 0.0,
-            "avf": 0.0,
-            "mvf": 0.0,
-            "axon_density_mm2": 0.0,
-        }
+    agg = compute_aggregate(
+        outer,
+        df_pass,
+        fascicle_mask,
+        config.PIXEL_SIZE,
+        group=group,
+        timepoint=timepoint,
+        excl_mask=excl_mask,
+    )
 
     # Save CSVs
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
@@ -810,9 +984,17 @@ def reset_image(stem: str):
     d = _out(stem)
     bak_inner = d / f"{stem}_axon_inner_original.npy"
     edited_outer = d / f"{stem}_outer_edited.npy"
+    gt_outer = d / f"{stem}_outer_gt.npy"
     fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
 
-    if not bak_inner.exists() and not edited_outer.exists() and not fascicle_edited.exists():
+    excl_path = d / f"{stem}_exclusion_mask.npy"
+    if (
+        not bak_inner.exists()
+        and not edited_outer.exists()
+        and not gt_outer.exists()
+        and not fascicle_edited.exists()
+        and not excl_path.exists()
+    ):
         return {"status": "no_backup"}
 
     if bak_inner.exists():
@@ -820,8 +1002,12 @@ def reset_image(stem: str):
         bak_inner.unlink()
     if edited_outer.exists():
         edited_outer.unlink()
+    if gt_outer.exists():
+        gt_outer.unlink()
     if fascicle_edited.exists():
         fascicle_edited.unlink()
+    if excl_path.exists():
+        excl_path.unlink()
 
     _save_edits(stem, {"deleted": [], "added": []})
     return {"status": "ok"}
@@ -878,7 +1064,7 @@ def _batch_recompute_worker(stems: list[str]):
                 minr, minc, maxr, maxc = bbox
                 axon_assignments[int(lbl)] = (minr, minc, inner[minr:maxr, minc:maxc] == lbl)
 
-            inner_new, pairs, df_all, index_image, _ = process_fibers(
+            inner_new, pairs, df_all, index_image = process_fibers(
                 outer, axon_assignments, config.PIXEL_SIZE
             )
             n_matched = len(pairs)
@@ -896,46 +1082,18 @@ def _batch_recompute_worker(stems: list[str]):
                     df_rej = df_rej[~df_rej["_fiber_label"].isin(bad_cl)]
 
             fascicle_mask = _load_fascicle_mask(stem, outer)
-            nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
+            excl_mask = _load_exclusion_mask(stem, fascicle_mask.shape)
             group, timepoint = _read_group_timepoint(stem)
 
-            if len(df_pass) and nerve_um2:
-                total_axon_um2 = df_pass["axon_area"].sum()
-                total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
-                avf = total_axon_um2 / nerve_um2
-                mvf = total_myelin_um2 / nerve_um2
-                agg = {
-                    "group": group,
-                    "timepoint": timepoint,
-                    "n_axons": len(df_pass),
-                    "nerve_area_mm2": nerve_um2 * 1e-6,
-                    "total_axon_area_mm2": total_axon_um2 * 1e-6,
-                    "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
-                    "nratio": avf + mvf,
-                    "gratio_aggr": df_pass["gratio"].mean(),
-                    "avf": avf,
-                    "mvf": mvf,
-                    "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
-                }
-            else:
-                agg = {
-                    "group": group,
-                    "timepoint": timepoint,
-                    **dict.fromkeys(
-                        [
-                            "n_axons",
-                            "nerve_area_mm2",
-                            "total_axon_area_mm2",
-                            "total_myelin_area_mm2",
-                            "nratio",
-                            "gratio_aggr",
-                            "avf",
-                            "mvf",
-                            "axon_density_mm2",
-                        ],
-                        0.0,
-                    ),
-                }
+            agg = compute_aggregate(
+                outer,
+                df_pass,
+                fascicle_mask,
+                config.PIXEL_SIZE,
+                group=group,
+                timepoint=timepoint,
+                excl_mask=excl_mask,
+            )
 
             pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
             df_pass[pub_cols].to_csv(d / f"{stem}_morphometrics.csv", index=False)

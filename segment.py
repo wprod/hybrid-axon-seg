@@ -23,7 +23,7 @@ from skimage import io, measure
 
 import config
 from detection import find_axons, run_cellpose_fibers
-from morphometrics import process_fibers
+from morphometrics import compute_aggregate, process_fibers
 from preprocessing import build_axon_input
 from qc import apply_qc
 from utils import build_fascicle_mask, clean_stem, find_low_qc_cluster_labels, find_satellite_labels
@@ -181,9 +181,53 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         np.save(str(cache_axon), inner_labels_raw)
         np.save(str(cache_multicore), np.array(sorted(multicore_labels), dtype=np.int32))
 
+    # ── Step 2b: Hard myelin-gap enforcement ─────────────────────────────
+    # Guarantee that no axon pixel is within the mandatory margin of its fiber
+    # boundary.  Works on the final assembled inner_labels_raw using the exact
+    # outer_labels that will be used for visualisation — so no mismatch is
+    # possible.  Catches any stray pixels that slip through per-crop processing
+    # (fill_holes edge cases, sub-pixel crop-boundary artefacts, etc.).
+    if config.AXON_MIN_MYELIN_FRAC > 0 or config.AXON_MIN_MYELIN_PX > 0:
+        from scipy.ndimage import distance_transform_edt as _edt
+
+        inner_labels_raw = np.zeros(outer_labels.shape, dtype=outer_labels.dtype)
+        for fiber_label, (r0, c0, crop) in axon_assignments.items():
+            inner_labels_raw[r0 : r0 + crop.shape[0], c0 : c0 + crop.shape[1]][crop] = fiber_label
+        # Precompute bboxes once — avoids repeated full-image scans inside the loop
+        _bboxes = {p.label: (p.bbox, p.area) for p in measure.regionprops(outer_labels)}
+        for lbl in np.unique(inner_labels_raw):
+            if lbl == 0:
+                continue
+            info = _bboxes.get(int(lbl))
+            if info is None:
+                continue
+            (minr, minc, maxr, maxc), area = info
+            fiber_crop = outer_labels[minr:maxr, minc:maxc] == lbl
+            fiber_radius_px = float(np.sqrt(area / np.pi))
+            min_px = max(
+                float(config.AXON_MIN_MYELIN_PX), config.AXON_MIN_MYELIN_FRAC * fiber_radius_px
+            )
+            dist_crop = _edt(fiber_crop)  # EDT on small crop, not full image
+            axon_crop = inner_labels_raw[minr:maxr, minc:maxc] == lbl
+            inner_labels_raw[minr:maxr, minc:maxc][axon_crop & (dist_crop <= min_px)] = 0
+        # Rebuild axon_assignments from the cleaned inner_labels_raw
+        fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer_labels)}
+        axon_assignments = {}
+        for lbl in np.unique(inner_labels_raw):
+            if lbl == 0:
+                continue
+            bbox = fiber_bboxes.get(int(lbl))
+            if bbox is None:
+                continue
+            minr, minc, maxr, maxc = bbox
+            crop = inner_labels_raw[minr:maxr, minc:maxc] == lbl
+            if crop.sum() >= config.MIN_AXON_SIZE:
+                axon_assignments[int(lbl)] = (minr, minc, crop)
+        np.save(str(cache_axon), inner_labels_raw)
+
     # ── Step 3: Morphometrics + QC ────────────────────────────────────────
     print("  Computing morphometrics…")
-    inner_labels, pairs, df_all, index_image, agg = process_fibers(
+    inner_labels, pairs, df_all, index_image = process_fibers(
         outer_labels,
         axon_assignments,
         config.PIXEL_SIZE,
@@ -219,40 +263,22 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
     np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
 
-    # Recompute aggregate stats from QC-passed fibers only
-    nerve_um2 = int(fascicle_mask.sum()) * config.PIXEL_SIZE**2
-    if len(df_pass) and nerve_um2:
-        total_axon_um2 = df_pass["axon_area"].sum()
-        total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
-        avf = total_axon_um2 / nerve_um2
-        mvf = total_myelin_um2 / nerve_um2
-        agg = {
-            "group": group,
-            "timepoint": timepoint,
-            "n_axons": len(df_pass),
-            "nerve_area_mm2": nerve_um2 * 1e-6,
-            "total_axon_area_mm2": total_axon_um2 * 1e-6,
-            "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
-            "nratio": avf + mvf,
-            "gratio_aggr": df_pass["gratio"].mean(),
-            "avf": avf,
-            "mvf": mvf,
-            "axon_density_mm2": len(df_pass) / (nerve_um2 * 1e-6),
-        }
-    else:
-        agg = {
-            "group": group,
-            "timepoint": timepoint,
-            "n_axons": 0,
-            "nerve_area_mm2": 0.0,
-            "total_axon_area_mm2": 0.0,
-            "total_myelin_area_mm2": 0.0,
-            "nratio": 0.0,
-            "gratio_aggr": 0.0,
-            "avf": 0.0,
-            "mvf": 0.0,
-            "axon_density_mm2": 0.0,
-        }
+    # Load exclusion zones (artefacts / tears drawn in the web UI)
+    excl_path = out_dir / f"{stem}_exclusion_mask.npy"
+    excl_mask = np.load(str(excl_path)) if excl_path.exists() else None
+    if excl_mask is not None and excl_mask.shape != fascicle_mask.shape:
+        excl_mask = None
+
+    # Aggregate stats — nratio uses ALL fibres, avf/mvf/density use QC-pass only
+    agg = compute_aggregate(
+        outer_labels,
+        df_pass,
+        fascicle_mask,
+        config.PIXEL_SIZE,
+        group=group,
+        timepoint=timepoint,
+        excl_mask=excl_mask,
+    )
 
     # ── Step 4: Save data ─────────────────────────────────────────────────
     pub_cols = [c for c in df_pass.columns if not c.startswith("_")]

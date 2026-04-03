@@ -15,16 +15,21 @@
       <button id="btn-next" title="Next (Right arrow)">&#9654;</button>
     </div>
     <div class="toolbar">
-      <button class="mode-btn active" data-mode="navigate">1 Navigate</button>
-      <button class="mode-btn" data-mode="delete">2 Delete</button>
-      <button class="mode-btn" data-mode="fiber">3 + Fiber</button>
-      <button class="mode-btn" data-mode="fascicle">4 Fascicle</button>
+      <button class="mode-btn active" data-mode="navigate" title="1 — Pan / zoom">1 Nav</button>
+      <button class="mode-btn" data-mode="delete" title="2 — Click a fiber to delete it">2 Delete</button>
+      <button class="mode-btn" data-mode="fiber" title="3 — Add a complete fiber (step 1: draw outer/myelin, step 2: draw axon inside)">3 +Fiber</button>
+      <button class="mode-btn" data-mode="fascicle" title="4 — Draw fascicle boundary polygon">4 Fasc</button>
+      <span class="sep-sm"></span>
+      <button class="mode-btn" data-mode="paint-axon" title="5 — Lasso: paint green (axon) inside an existing fiber">5 +Green</button>
+      <button class="mode-btn" data-mode="paint-outer" title="6 — Lasso: paint violet (new outer fiber, no axon)">6 +Violet</button>
+      <button class="mode-btn" data-mode="erase-outer" title="7 — Lasso: erase violet and green inside the zone">7 Erase</button>
+      <button class="mode-btn" data-mode="exclude" title="8 — Draw a zone excluded from N-ratio/AVF/MVF denominator (total nerve area is kept in the data)">8 Excl</button>
     </div>
     <span class="sep"></span>
     <div class="toolbar">
       <button id="btn-recompute" class="action green">Recompute</button>
       <button id="btn-reset" class="action amber">Reset</button>
-      <button id="btn-recompute-all" class="action blue" title="Recompute morphometrics for all processed images (background — app stays usable)">Recompute All</button>
+      <button id="btn-recompute-all" class="action blue" title="Recompute all images (background — app stays usable)">Recompute All</button>
       <span id="batch-progress" class="batch-progress"></span>
     </div>
     <span class="sep"></span>
@@ -35,7 +40,7 @@
       <button id="btn-compare" class="action blue" title="Open multi-image comparison">Compare</button>
     </div>
     <span class="sep"></span>
-    <label class="opacity-ctrl" title="Opacité de l'overlay — glisser pour voir l'image brute">
+    <label class="opacity-ctrl" title="Overlay opacity — drag to reveal raw image">
       <span>👁</span>
       <input type="range" id="opacity-slider" min="0" max="100" value="85">
       <span id="opacity-val">85%</span>
@@ -53,11 +58,13 @@
 
     <section id="viewer">
       <canvas id="canvas"></canvas>
+      <div id="op-bar"><div id="op-bar-fill"></div></div>
       <div id="hint" class="hint">No images found. Run the pipeline first.</div>
       <div id="loading" class="loading hidden">Loading...</div>
       <div id="status-bar">
         <span id="coords">--</span>
         <span id="zoom-info">100%</span>
+        <span id="queue-status" class="hidden"></span>
         <span id="edit-info"></span>
       </div>
     </section>
@@ -65,26 +72,40 @@
     <aside id="panel">
       <h3>Clinician Metrics</h3>
       <table id="tbl-metrics"><tbody></tbody></table>
+
       <div id="fascicle-panel" class="mt hidden">
         <h3>Fascicle <span id="fasc-badge" class="badge" style="background:#F1C40F;color:#000">edited</span></h3>
         <button id="btn-clear-fasc" class="action amber" style="width:100%;margin-top:6px">✕ Clear fascicle</button>
       </div>
+
+      <div id="exclusion-panel" class="mt hidden">
+        <h3>Exclusion <span class="badge" style="background:#E67E22;color:#000">active</span></h3>
+        <div class="sc" style="margin-top:4px;color:var(--muted)">Subtracted from nerve area for ratio calculations</div>
+        <button id="btn-clear-excl" class="action amber" style="width:100%;margin-top:6px">✕ Clear exclusion</button>
+      </div>
+
       <h3 class="mt">Segmentation</h3>
       <table id="tbl-seg"><tbody></tbody></table>
+
       <div id="shortcuts" class="mt">
         <h3>Shortcuts</h3>
-        <div class="sc">1/2/3/4 &mdash; mode</div>
-        <div class="sc">Left/Right &mdash; prev/next</div>
-        <div class="sc">F &mdash; fit to view</div>
-        <div class="sc">Scroll &mdash; zoom</div>
-        <div class="sc">Right-drag / Space+drag &mdash; pan</div>
-        <div class="sc">Esc &mdash; cancel draw</div>
-        <div class="sc" style="margin-top:6px;color:#F1C40F">4 Fascicle: click points,<br>close = 1st pt or dbl-click</div>
+        <div class="sc">1/2/3/4 — nav / delete / +fiber / fasc</div>
+        <div class="sc">5/6/7/8 — +green / +violet / erase / excl</div>
+        <div class="sc">Left/Right — prev/next</div>
+        <div class="sc">F — fit to view</div>
+        <div class="sc">Scroll — zoom</div>
+        <div class="sc">Right-drag / Space+drag — pan</div>
+        <div class="sc">Esc — cancel draw</div>
+        <div class="sc" style="margin-top:6px;color:#66bb6a">5 +Green: drag lasso → fills axon (green)</div>
+        <div class="sc" style="color:#9b59b6">6 +Violet: drag lasso → fills outer fiber (violet)</div>
+        <div class="sc" style="color:#ef5350">7 Erase: drag lasso → erases violet + green</div>
+        <div class="sc" style="color:#E67E22">8 Excl: polygon → excluded from N-ratio denom.</div>
+        <div class="sc" style="color:#F1C40F">4 Fasc: click pts, close = 1st pt</div>
       </div>
     </aside>
   </main>
 
   <div id="toasts"></div>
-  <script src="/static/app.js?v=3"></script>
+  <script src="/static/app.js?v=6"></script>
 </body>
 </html>

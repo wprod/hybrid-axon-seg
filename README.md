@@ -12,11 +12,12 @@ and axon density — with full QC overlay output.
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Quick Start](#quick-start)
+2. [Recommended Workflow](#recommended-workflow)
 3. [Web Validation UI](#web-validation-ui)
    - [Running the App](#running-the-app)
    - [Remote Access (Cloudflare Tunnel)](#remote-access-cloudflare-tunnel)
 4. [Pipeline Architecture](#pipeline-architecture)
+   - [Step 0 — Preprocessing: Contrast Stretch](#step-0--preprocessing-contrast-stretch)
    - [Step 1 — Cellpose Pass 1: Outer Fibers](#step-1--cellpose-pass-1-outer-fibers)
    - [Step 2 — Normalized Inversion: Building `axon_input`](#step-2--normalized-inversion-building-axon_input)
    - [Step 3 — Global Otsu Axon Detection](#step-3--global-otsu-axon-detection)
@@ -39,21 +40,23 @@ images where **myelin sheaths appear dark** and **axon interiors appear bright**
 This pipeline automates the full morphometric analysis:
 
 ```
-edited TIFF  →  Cellpose (outer fibers)  →  normalized inversion
-             →  Otsu threshold (axon blobs)  →  morphometrics  →  QC  →  outputs
+edited TIFF  →  contrast stretch  →  Cellpose (cpsam, outer fibers)
+             →  normalized inversion  →  Otsu threshold (axon blobs)
+             →  morphometrics  →  QC  →  outputs
 ```
 
 Key design decisions:
 
 | Decision | Rationale |
 |---|---|
-| **Cellpose is the source of truth for fiber count** | Deep-learning segmentation handles touching fibers, irregular shapes, and staining variability better than any threshold-based approach |
+| **Cellpose cpsam is the source of truth for fiber count** | Deep-learning segmentation handles touching fibers, irregular shapes, and staining variability better than any threshold-based approach |
+| **Percentile stretch before Cellpose** | Global p2–p98 stretch removes the gray veil, making myelin rings and axon centers pop; improves Cellpose detection without introducing CLAHE artefacts |
 | **Per-fiber normalization before inversion** | Each fiber is contrast-stretched independently, making the axon/myelin contrast invariant to global staining intensity gradients |
-| **Distance-transform erosion at fiber boundary** | Strips endoneurium contamination introduced by Cellpose boundary pixels before any intensity measurement |
 | **Global Otsu on the full `axon_input` image** | All normalized fiber pixels together form a clean bimodal distribution — one threshold for the entire image, no per-fiber fitting |
-| **Crop-based morphometrics** | All per-fiber operations use small bounding-box crops instead of full-image masks, keeping memory and runtime linear in fiber count |
-| **Two-level cache** | Cellpose results and axon detections are cached separately so detection parameters can be tuned without re-running Cellpose (~5 min on GPU) |
-| **Fascicle area denominator** | AVF, MVF, N-ratio and density use the nerve fascicle area (convex Gaussian-smoothed envelope of the fiber mask) rather than total image area |
+| **Manual fascicle mask (web UI)** | The clinician draws the nerve fascicle boundary in the web UI; this mask is used as the denominator for AVF, MVF, N-ratio, and density, and constrains Cellpose to the fascicle area |
+| **Hull-constrained closing** | Axon blob gap-filling uses closing intersected with the convex hull — fills C-shapes without pushing the blob toward the myelin edge |
+| **Dual outer-labels (edited + gt)** | Clinician corrections are split: `_outer_edited.npy` tracks corrected predictions, `_outer_gt.npy` is the complete ground truth (includes additions). The diff reveals model false-negatives for fine-tuning |
+| **Two-level cache** | Cellpose results and axon detections are cached separately so detection parameters can be tuned without re-running Cellpose |
 
 > **Image preparation:** contrast and brightness must be adjusted manually
 > (with a medical eye) in ImageJ/Fiji before running the pipeline, as optimal
@@ -61,28 +64,46 @@ Key design decisions:
 
 ---
 
-## Quick Start
+## Recommended Workflow
 
-```bash
-# 1. Install dependencies (Python 3.11+, CUDA or MPS recommended for Cellpose)
-pip install -r requirements.txt
+```
+1. Place images in edited/<Group Xw>/<stem>.tif
+   (e.g. edited/ALLO A 12w/alloA12w1L.tif)
 
-# 2. Place your contrast-adjusted TIFF images in the edited/ directory
+2. Start the web app
+   python app.py  →  http://127.0.0.1:8000
 
-# 3. Run the full pipeline on all images
-python segment.py
+3. For each image, draw the fascicle boundary
+   Select image → mode 4 (Fascicle) → click polygon points → close near first point
+   (or double-click to close)
 
-# 4. Or process a single image
-python segment.py "edited/MyImage.tif"
+4. Run segment.py once all fascicle masks are drawn
+   python segment.py
+
+5. Review results in the web app (works on desktop + iPad with Apple Pencil)
+   - Delete false-positive axons (mode 2)
+   - Add missing fibers (mode 3) — saved to ground truth only for fine-tuning
+   - Draw exclusion zones (mode 8) — artefacts/tears subtracted from nerve area
+   - Click "Recompute" to apply edits to a single image
+   - Images with pending edits show a ⚠ badge in the sidebar
+
+6. Export: output/summary.csv + per-image CSVs in output/<stem>/
 ```
 
-All parameters are in `config.py` — no code changes needed for routine use.
+> **Cache behaviour:** Cellpose results are cached in `*_cellpose_outer.npy`.
+> If the fascicle mask is updated after the last Cellpose run, segment.py
+> automatically invalidates the cache and reruns Cellpose. To force a full
+> rerun on all images, delete the `*_cellpose_outer.npy` files and rerun
+> `segment.py`.
 
 ---
 
 ## Web Validation UI
 
-`app.py` is a FastAPI-based browser UI for manual review and correction of segmentation results. It lets a clinician inspect every image, delete false-positive axons, draw missing ones, and trigger recomputation — without touching the command line.
+`app.py` is a FastAPI-based browser UI for manual review and correction of
+segmentation results. It lets a clinician inspect every image, draw fascicle
+boundaries, delete false-positive axons, add missing ones, and trigger
+recomputation — without touching the command line.
 
 ### Running the App
 
@@ -102,16 +123,47 @@ APP_PASSWORD=mypassword python app.py
 
 | Action | How |
 |---|---|
-| Browse all images | Sidebar list with axon count and edit status |
-| View overlay / numbered / dashboard / g-ratio map | Tabs per image |
-| Delete a false-positive axon | Click on it |
-| Add a missing axon | Draw polygon inside a fiber |
-| Add a brand-new fiber | Draw outer + inner polygons |
+| Browse all images | Sidebar — shows axon count, edit status, ⚠ if recompute pending |
+| Blend overlay with raw image | Opacity slider in the header |
+| View overlay / numbered / dashboard / g-ratio map | Buttons per image |
+| Draw fascicle boundary | Mode 4 — click polygon points, close near first point or double-click |
+| Clear fascicle | "Clear fascicle" in right panel |
+| Delete a false-positive fiber | Mode 2 — click on it |
+| Add a complete fiber (outer + axon) | Mode 3 — two-step lasso (saved to GT only) |
+| Paint axon inside existing fiber | Mode 5 — freehand lasso |
+| Paint new outer (myelin only) | Mode 6 — freehand lasso (saved to GT only) |
+| Erase region | Mode 7 — freehand lasso |
+| Mark exclusion zone | Mode 8 — polygon (subtracted from nerve area) |
 | Recompute morphometrics | "Recompute" button (single image) |
-| Recompute all images + rebuild summary | "Recompute All" button |
-| Rebuild comparison figure only | "Rebuild Summary" button |
+| Recompute all images | "Recompute All" button (background — app stays usable) |
+| Open multi-image comparison | "Compare" button |
 
-All edits are saved to `*_edits.json` and original `.npy` files are kept as `*_original.npy` backups. A "Reset" button restores any image to its pre-edit state.
+**iPad / Apple Pencil support:**
+
+The app uses Pointer Events for unified mouse/touch/stylus input:
+
+| Gesture | Action |
+|---|---|
+| **Pencil** tap/drag | Active tool (delete, lasso, polygon) |
+| **Finger** drag | Pan |
+| **Finger** pinch | Zoom |
+| Mouse left-click | Active tool |
+| Mouse right-click / middle-click / space+drag | Pan |
+| Mouse wheel | Zoom |
+
+Keyboard shortcuts (1–8, Esc, arrows, F) work with an external keyboard.
+
+**Dual label maps for fine-tuning:**
+
+| File | Content | Purpose |
+|---|---|---|
+| `_outer_edited.npy` | Cellpose + deletions + modifications | Corrected prediction (no additions) |
+| `_outer_gt.npy` | Cellpose + deletions + modifications + additions | Ground truth (complete) |
+
+Deletions and modifications update both files. Manual additions (new fibers the model missed) go only to `_outer_gt.npy`. This lets you compute false-negatives (`gt − edited`) and false-positives (deleted labels) for fine-tuning Cellpose.
+
+All edits are saved to `*_edits.json` and original `.npy` files are kept as
+`*_original.npy` backups. A "Reset" button restores any image to its pre-edit state.
 
 ### Remote Access (Cloudflare Tunnel)
 
@@ -134,43 +186,52 @@ Cloudflare prints a public URL (e.g. `https://xyz-abc.trycloudflare.com`). Send 
 
 ## Pipeline Architecture
 
+### Step 0 — Preprocessing: Contrast Stretch
+
+**File:** `detection.py → _clahe_preprocess()`
+**Enabled by:** `CP_CLAHE = True`
+
+Before Cellpose, the raw image is **globally stretched** from p2–p98 to 0–255.
+This removes the gray veil present in some toluidine-blue images, making the
+myelin ring / axon center pattern more prominent and improving Cellpose detection.
+
+Optionally, CLAHE can be applied after the stretch by setting
+`CLAHE_CLIP_LIMIT > 0`, but in practice the stretch alone performs best.
+
+---
+
 ### Step 1 — Cellpose Pass 1: Outer Fibers
 
 **File:** `detection.py → run_cellpose_fibers()`
 
 Cellpose ([Stringer et al., 2021](https://doi.org/10.1038/s41592-020-01018-x))
-is a deep-learning instance segmentation model trained on a large corpus of
-biological cell images. The `cyto3` model is used here to segment entire
+is a deep-learning instance segmentation model. The `cpsam` model (Cellpose 4)
+is used with `augment=True` (4-orientation averaging) for robust detection of
 myelinated fiber cross-sections (axon + myelin sheath together).
 
 **How Cellpose works:**
 Rather than detecting explicit boundaries, Cellpose uses a gradient-flow
 formulation. It predicts, for every pixel, the 2-D vector pointing toward
-the center of its containing cell. Starting from each pixel, these vectors
-are integrated as a flow until convergence — pixels that converge to the
-same attractor belong to the same cell. This approach is robust to touching
-and overlapping objects, where classical watershed methods fail.
+the center of its containing cell. Pixels that converge to the same attractor
+belong to the same cell. This approach is robust to touching and overlapping
+objects.
 
 **Parameters:**
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `CP_MODEL` | `cyto3` | Pretrained Cellpose 3 model |
-| `CP_DIAM_UM` | `7.0 µm` | Expected fiber diameter (sets internal rescaling) |
-| `CP_FLOW_THR` | `0.4` | Flow error threshold — lower is more permissive |
-| `CP_CELLPROB` | `0.0` | Cell probability threshold — lower detects more |
-
-The diameter in pixels fed to Cellpose is:
-
-$$d_{px} = \frac{\texttt{CP\_DIAM\_UM}}{\texttt{PIXEL\_SIZE}}$$
+| `CP_MODEL` | `cpsam` | Cellpose 4 model |
+| `CP_DIAM_UM` | `5.0 µm` | Expected fiber diameter (sets internal rescaling) |
+| `CP_FLOW_THR` | `0.3` | Flow error threshold — lower is more permissive |
+| `CP_CELLPROB` | `-1.0` | Cell probability threshold — lower detects more |
 
 **Post-processing:**
-- Each fiber mask is **eroded** by `OUTER_ERODE_PX` pixels (via distance transform) to shrink the fiber boundary and reduce myelin bleed into adjacent regions.
-- **Isolated cluster removal** (`MAIN_CLUSTER_DILATION_PX`): fiber masks are dilated and grouped into connected components; any fiber whose centroid lies outside the largest component (the main nerve fascicle) is discarded. This removes parasitic fiber clusters at image edges.
+- If a **manual fascicle mask** exists, Cellpose runs only inside the fascicle boundary (background pixels are set to median intensity before passing to Cellpose).
+- Each fiber mask is **eroded** by `OUTER_ERODE_PX` pixels to shrink the fiber boundary and reduce myelin bleed.
+- **Satellite fiber removal**: isolated fibers with fewer than `MIN_SATELLITE_NEIGHBORS` neighbours within 5× fiber diameter are removed (skipped when a fascicle mask is present).
+- **Low-QC cluster removal**: clusters of fibers with a QC pass rate below `MIN_CLUSTER_QC_RATE` or fewer than `MIN_CLUSTER_FRACTION` × largest-cluster fiber count are removed.
 
-**Output:** An integer label array where each pixel contains its fiber ID
-(1 to N) or 0 for background. This label map is the **source of truth for
-fiber count** and is cached as `*_cellpose_outer.npy`.
+**Output:** An integer label array cached as `*_cellpose_outer.npy`.
 
 ---
 
@@ -178,80 +239,35 @@ fiber count** and is cached as `*_cellpose_outer.npy`.
 
 **File:** `preprocessing.py → _invert_crop(), build_axon_input()`
 
-This is the most critical preprocessing step. The goal is to transform each
-fiber crop so that:
+This step transforms each fiber crop so that:
 
-- **Axon interior** (originally bright in toluidine blue) → **dark blob ≈ 0**
-- **Myelin sheath** (originally dark in toluidine blue) → **bright ring ≈ 255**
-- **Background / endoneurium boundary** → **white = 255** (excluded from analysis)
+- **Axon interior** (originally bright) → **dark blob ≈ 0**
+- **Myelin sheath** (originally dark) → **bright ring ≈ 255**
+- **Background / boundary** → **white = 255** (excluded)
 
-This representation is then globally thresholded in Step 3 to cleanly separate
-axons from myelin without any per-fiber fitting.
+> Note: this step always uses the **original raw image**, not the
+> contrast-stretched version used by Cellpose.
 
 #### 2a — Distance-Transform Boundary Erosion
 
-Cellpose masks include a boundary zone of ~1–3 px where the staining is
-ambiguous (endoneurium, adjacent fiber contamination). If these pixels are
-included in the normalization, bright boundary artefacts invert to near-black
-and create false dark rings around every fiber.
-
-To remove this zone, a **Euclidean distance transform** is computed on the
-fiber mask:
-
-$$D(x,y) = \min_{(x', y') \notin \text{fiber}} \|(x,y) - (x',y')\|_2$$
-
-Only pixels with $D(x,y) > \texttt{MASK\_ERODE\_PX}$ form the **clean
-interior** (`inner`). This is geometrically equivalent to morphological
-erosion by `MASK_ERODE_PX` pixels, but the continuous distance values are
-reused in the fade step below. Erosion depth is also capped at 25% of the
-fiber equivalent radius to preserve signal in small or thin-myelin fibers.
+A Euclidean distance transform on the fiber mask excludes the boundary zone
+where endoneurium contamination is likely. Erosion depth is capped at 25% of
+the fiber equivalent radius to preserve signal in small fibers.
 
 #### 2b — Per-Fiber Percentile Stretch
 
-Contrast is normalized independently for each fiber using the **5th–95th
-percentile** of the clean interior pixels:
+Contrast is normalized using the 5th–95th percentile of clean interior pixels:
 
 $$I_{\text{stretched}}(x,y) = \text{clip}\!\left(\frac{I(x,y) - p_5}{p_{95} - p_5} \cdot 255,\ 0,\ 255\right)$$
-
-Using percentiles rather than min/max makes the stretch robust to isolated
-bright or dark outlier pixels (artefacts, staining clumps). After this step,
-every fiber uses the full 0–255 dynamic range regardless of absolute staining
-intensity.
 
 #### 2c — Inversion
 
 $$I_{\text{inverted}}(x,y) = 255 - I_{\text{stretched}}(x,y)$$
 
-After inversion: myelin (originally near 0) → near 255; axon (originally
-near 255) → near 0.
+#### 2d — Inward Fade
 
-#### 2d — Inward Fade (Gradient Blending)
-
-To prevent any hard black ring at the eroded boundary, a **smooth inward
-fade** blends from white (255) at the eroded edge to fully inverted at
-`FADE_PX` pixels inward.
-
-A second distance transform is computed on the `inner` mask:
-
-$$D_{\text{inner}}(x,y) = \text{distance from pixel to the eroded boundary}$$
-
-The fade weight:
-
-$$\alpha(x,y) = \text{clip}\!\left(\frac{D_{\text{inner}}(x,y)}{\texttt{FADE\_PX}},\ 0,\ 1\right)$$
-
-Final blended value:
-
-$$I_{\text{result}}(x,y) = 255 + \bigl(I_{\text{inverted}}(x,y) - 255\bigr) \cdot \alpha(x,y)$$
-
-- At the eroded boundary ($\alpha = 0$): result = **255** (white).
-- At `FADE_PX` px inward ($\alpha = 1$): result = $I_{\text{inverted}}$ (fully inverted).
-- In between: smooth linear interpolation.
-
-All pixels outside `inner` (the boundary zone) are set to **255** so they
-do not influence the Otsu threshold.
-
-The resulting `axon_input` image is saved as `*_axon_input.png` for visual
-debugging.
+A smooth fade from white at the eroded edge to fully inverted at `FADE_PX`
+pixels inward prevents hard black ring artefacts at the boundary.
 
 ---
 
@@ -259,48 +275,33 @@ debugging.
 
 **File:** `detection.py → find_axons()`
 
-#### 3a — Global Otsu Threshold
-
-Otsu's method ([Otsu, 1979](https://doi.org/10.1109/TSMC.1979.4310076))
-finds the threshold $t^*$ that **minimises intra-class variance**
-(equivalently, maximises inter-class variance) over all fiber pixels:
+Otsu's method finds the threshold that maximises inter-class variance over
+all fiber pixels:
 
 $$t^* = \arg\max_t \; \omega_0(t)\,\omega_1(t)\,\bigl[\mu_0(t) - \mu_1(t)\bigr]^2$$
 
-where $\omega_0(t), \omega_1(t)$ are the proportions of pixels below / above $t$,
-and $\mu_0(t), \mu_1(t)$ are their respective means.
+**Why global?** Per-fiber normalization makes all axon pixels cluster around
+~0–80 and all myelin pixels around ~180–255 across the entire image, giving a
+clean bimodal histogram. Global Otsu is simpler and more stable than per-fiber
+thresholding.
 
-**Why global (not per-fiber)?**
-Because `axon_input` has already been *per-fiber* normalized, all axon pixels
-across the entire image cluster around values ~0–80, and all myelin pixels
-cluster around ~180–255. Pooling all fiber pixels into one histogram produces
-a clean bimodal distribution, making global Otsu both simpler and more stable
-than per-fiber thresholding (which is unstable for small or thin-myelin fibers).
+After thresholding, the correct axon blob is selected by centroid (falls back
+to largest blob). Multicore fibers (multiple distinct blobs) are flagged.
 
-#### 3b — Connected-Component Selection
+**Post-processing per blob:**
 
-After thresholding, each fiber crop may contain multiple dark blobs (e.g.
-two touching axons, or residual noise). The **centroid-based** rule selects
-the correct axon:
-
-1. Label all connected components within the fiber mask.
-2. Look up which component label falls at the **fiber centroid** (from Cellpose).
-3. If the centroid pixel is dark → that component is the axon.
-4. If the centroid pixel is bright (no dark blob at center) → fall back to
-   the **largest** connected component.
-
-This rule is robust because the axon is nearly always centered within its
-fiber. The fallback to "largest component" handles the rare case of a
-de-centered axon.
-
-Fibers with **multiple distinct dark blobs** (potential multicore fibers) are
-flagged and tracked separately — they are excluded from QC pass but recorded.
-
-#### 3c — Hole Filling + Minimum Size Filter
-
-`scipy.ndimage.binary_fill_holes` fills any internal holes in the selected
-blob (e.g. staining voids within a large axon). Blobs smaller than
-`MIN_AXON_SIZE` pixels are discarded.
+1. **Hull-constrained closing** — `binary_closing(disk(6)) & convex_hull_image()`.
+   Closing fills C-shape gaps; intersecting with the convex hull prevents the
+   blob from being pushed toward the nearest myelin edge (the original
+   `closing(disk(8))` caused axons to "stick" to the myelin on one side).
+2. **Adaptive myelin margin** — the axon must be at least
+   `max(AXON_MIN_MYELIN_PX, AXON_MIN_MYELIN_FRAC × fiber_radius)` pixels from
+   the fiber edge. Large fibers get a proportionally larger gap.
+3. **Gaussian smoothing** (`AXON_SMOOTH_SIGMA`) — smooths the perimeter.
+4. **Adaptive dilation** (`AXON_DILATE_PX`) — compensates for Otsu
+   under-segmentation. Reduced for large fibers.
+5. **Morphological opening** (`AXON_OPEN_PX`) — removes thin protrusions.
+6. All operations are clipped to the margin mask (hard guarantee).
 
 ---
 
@@ -308,81 +309,24 @@ blob (e.g. staining voids within a large axon). Blobs smaller than
 
 **File:** `morphometrics.py → process_fibers()`
 
-All measurements are computed in physical units (µm, µm²) using `PIXEL_SIZE`.
-All operations run on **small bounding-box crops** of the full image — never
-on full-size arrays — keeping runtime $O(N \cdot \bar{A})$ rather than
-$O(N \cdot H \cdot W)$.
+All measurements use physical units (µm) via `PIXEL_SIZE`. Operations run on
+bounding-box crops for efficiency.
 
-#### Equivalent Circle Diameter (ECD)
+| Metric | Formula |
+|---|---|
+| ECD | $\sqrt{4A/\pi} \cdot \texttt{PIXEL\_SIZE}$ |
+| G-ratio | $d_{\text{axon}} / d_{\text{fiber}}$ |
+| Myelin thickness | $(d_{\text{fiber}} - d_{\text{axon}}) / 2$ |
+| Centroid offset | $\|\mathbf{c}_{\text{axon}} - \mathbf{c}_{\text{fiber}}\| / \sqrt{A_{\text{fiber}}/\pi}$ |
 
-The diameter of the circle with the same area as the measured region:
+**Aggregate stats** (`compute_aggregate()`):
 
-$$d = \sqrt{\frac{4\,A}{\pi}} \cdot \texttt{PIXEL\_SIZE}$$
-
-Applied to both the outer fiber ($A_{\text{fiber}}$ from Cellpose) and the
-inner axon ($A_{\text{axon}}$ from the thresholded blob).
-
-#### G-ratio
-
-The fundamental myelination metric, introduced by Rushton (1951):
-
-$$g = \frac{d_{\text{axon}}}{d_{\text{fiber}}}$$
-
-A g-ratio of ~0.6 is considered optimal for conduction velocity in mammalian
-peripheral nerve ([Chomiak & Bhatt, 2009](#references)). Values approaching
-0 indicate extreme hypermyelination; values approaching 1 indicate minimal
-myelin.
-
-#### Myelin Thickness
-
-Average radial thickness of the myelin sheath:
-
-$$t_{\text{myelin}} = \frac{d_{\text{fiber}} - d_{\text{axon}}}{2}$$
-
-#### Centroid Offset
-
-Normalised displacement of the axon centroid relative to the fiber centroid:
-
-$$\delta = \frac{\|\mathbf{c}_{\text{axon}} - \mathbf{c}_{\text{fiber}}\|_2}{\sqrt{A_{\text{fiber}}/\pi}}$$
-
-$\delta = 0$ means perfectly centered; $\delta = 1$ means the axon centroid
-lies at the fiber boundary. High values indicate detection errors or
-pathological fiber geometry.
-
-#### Shape Descriptors
-
-**Solidity:**
-
-$$\text{solidity} = \frac{A_{\text{axon}}}{A_{\text{convex hull}}}$$
-
-Close to 1 for compact round shapes; low for fragmented or concave shapes.
-
-**Eccentricity:**
-
-$$\varepsilon = \sqrt{1 - \frac{b^2}{a^2}}$$
-
-where $a$ and $b$ are the semi-major and semi-minor axes of the best-fit
-ellipse. $\varepsilon = 0$ for a perfect circle; $\varepsilon \to 1$ for
-a needle-like shape.
-
-#### Fascicle Area & Aggregate Metrics
-
-The nerve fascicle area is estimated by:
-1. Morphologically closing the union of all fiber masks (`disk(30)`) to fill inter-fiber gaps.
-2. Filling remaining internal holes (`binary_fill_holes`).
-3. Applying a Gaussian blur (`sigma=40`) and thresholding at 0.35 to produce a smooth, slightly expanded convex envelope.
-
-This fascicle mask is used as the denominator for all volume fractions and density, giving biologically meaningful values independent of image crop size.
-
-| Metric | Formula | Unit |
-|---|---|---|
-| AVF | $\displaystyle\frac{\sum_i A_{\text{axon},i}}{A_{\text{fascicle}}}$ | fraction |
-| MVF | $\displaystyle\frac{\sum_i \left(A_{\text{fiber},i} - A_{\text{axon},i}\right)}{A_{\text{fascicle}}}$ | fraction |
-| N-ratio | $\text{AVF} + \text{MVF}$ | fraction |
-| Aggregate g-ratio | $\bar{g} = \text{mean}(g_i)$ | — |
-| Axon density | $\displaystyle\frac{N}{A_{\text{fascicle}} \cdot 10^{-6}}$ | axons/mm² |
-
-where $A_{\text{fascicle}}$ is in µm².
+- **N-ratio** counts ALL detected fibers (pass + rejected + no-axon) because
+  every fibre occupies nerve cross-section regardless of health.
+- **AVF / MVF / G-ratio / density** use QC-passed fibers only (functional population).
+- **Exclusion zones** (artefacts, tears drawn in the web UI) are subtracted
+  from the fascicle area denominator so they don't dilute the ratios.
+- The fascicle area (manual or auto-computed) is the base denominator.
 
 ---
 
@@ -390,22 +334,17 @@ where $A_{\text{fascicle}}$ is in µm².
 
 **File:** `qc.py → apply_qc()`
 
-Each fiber is independently tested against six filters. The **first failing
-filter** determines the rejection code shown on the overlay.
+| Code | Filter | Default threshold |
+|---|---|---|
+| `G` | G-ratio | $[0.3,\ 0.9]$ |
+| `lgG` | Large-fiber g-ratio (≥ p85) | g < 0.5 |
+| `shp` | Shape discordance | fiber_solidity − axon_solidity > 0.2 |
+| `sol` | Solidity | ≥ 0.1 |
+| `off` | Centroid offset | ≤ 0.95 |
+| `Ø` | Axon diameter | ≥ 0.5 µm |
+| `brd` | Image border | excluded |
 
-| Code | Filter | Default threshold | Biological rationale |
-|---|---|---|---|
-| `G` | G-ratio | $[0.3,\ 0.9]$ | Outside normal myelination range |
-| `lgG` | Large-fiber g-ratio | large fibers (≥ p85) with g < 0.5 | Oversized axon in large fiber — likely detection error |
-| `shp` | Shape discordance | fiber_solidity − axon_solidity > 0.2 | Round fiber but irregular axon — likely artefact |
-| `sol` | Solidity | $\geq 0.1$ | Non-convex / fragmented blob |
-| `off` | Centroid offset | $\leq 0.95$ | Severely off-center axon |
-| `Ø` | Axon diameter | $\geq 0.5\,\mu\text{m}$ | Below resolution limit |
-| `brd` | Image border | excluded | Incomplete fiber at image edge |
-
-> **Note:** All thresholds are intentionally permissive — the clinician
-> reviews the color-coded overlay and adjusts `config.py` to fit the study
-> protocol and tissue preparation.
+All thresholds are intentionally permissive — adjust in `config.py`.
 
 ---
 
@@ -413,38 +352,14 @@ filter** determines the rejection code shown on the overlay.
 
 **File:** `visualization.py`
 
-#### Overlay (`*_overlay.png`)
-
-Full-resolution colour-coded image with every fiber annotated:
-
-- Each QC-passed fiber shows a **green axon contour** and **blue myelin ring**.
-- Each rejected fiber is **color-coded by rejection reason** (see color scheme below), with the rejection code printed in yellow at its centroid.
-- Fibers with no detected axon are shaded **red**.
-- A **white contour** outlines the estimated nerve fascicle boundary.
-- A semi-transparent legend box is embedded in the bottom-left corner.
-
-#### Numbered Image (`*_numbered.png`)
-
-Same overlay with sequential **yellow numbers** on each QC-passed axon and
-a top banner displaying: count, nerve area, mean axon diameter, mean fiber
-diameter, mean g-ratio.
-
-#### G-ratio Heatmap (`*_gratio_map.png`)
-
-Each axon pixel is coloured by its g-ratio on the **RdYlGn** colormap:
-red = low g-ratio (thin myelin relative to axon), green = high g-ratio
-(thick myelin), yellow = ~0.6 (optimal). A colorbar is included.
-
-#### Dashboard (`*_dashboard.png`)
-
-Summary figure with distributions, scatter plots, and aggregate metrics table
-(AVF, MVF, N-ratio, mean g-ratio, axon density, nerve area, QC counts).
+- **`*_overlay.png`** — Full-resolution color-coded overlay (green axon, blue myelin, rejection colors, white fascicle boundary)
+- **`*_numbered.png`** — Overlay with sequential numbers on QC-passed axons + stats banner
+- **`*_gratio_map.png`** — Per-axon g-ratio heatmap (RdYlGn colormap)
+- **`*_dashboard.png`** — Distributions, scatter plots, aggregate metrics table
 
 ---
 
 ## Mathematics
-
-Complete formula reference:
 
 $$d_{\text{ECD}} = \sqrt{\frac{4A}{\pi}} \cdot s \qquad (s = \texttt{PIXEL\_SIZE},\ \text{µm/px})$$
 
@@ -458,15 +373,9 @@ $$\text{AVF} = \frac{\displaystyle\sum_i A_{\text{axon},i}}{A_{\text{fascicle}}}
 
 $$\text{MVF} = \frac{\displaystyle\sum_i \bigl(A_{\text{fiber},i} - A_{\text{axon},i}\bigr)}{A_{\text{fascicle}}}$$
 
-$$\text{N-ratio} = \text{AVF} + \text{MVF}$$
+$$\text{N-ratio} = \frac{\displaystyle\sum_{\text{all fibers}} A_{\text{fiber},i}}{A_{\text{fascicle}} - A_{\text{exclusion}}}$$
 
 $$\text{density} = \frac{N}{A_{\text{fascicle}} \cdot 10^{-6}} \quad [\text{axons/mm}^2]$$
-
-$$\text{solidity} = \frac{A_{\text{region}}}{A_{\text{convex hull}}}$$
-
-$$\varepsilon = \sqrt{1 - \frac{b^2}{a^2}} \quad (a \geq b = \text{ellipse semi-axes})$$
-
-$$t^*_{\text{Otsu}} = \arg\max_t\; \omega_0(t)\,\omega_1(t)\,\bigl[\mu_0(t)-\mu_1(t)\bigr]^2$$
 
 ---
 
@@ -476,54 +385,65 @@ All parameters live in `config.py`. Edit there — no code changes needed.
 
 ```python
 # I/O
-INPUT_DIR  = Path("edited")   # source TIFF directory (contrast-adjusted images)
+INPUT_DIR  = Path("edited")   # source TIFF directory (subfolders = group/timepoint)
 OUTPUT_DIR = Path("output")   # results directory
 PIXEL_SIZE = 0.09             # µm per pixel at acquisition resolution
 
 # Cellpose — pass 1 (outer fibers)
-CP_MODEL    = "cyto3"   # Cellpose model name
-CP_DIAM_UM  = 7.0       # expected fiber diameter (µm)
-CP_FLOW_THR = 0.4       # flow error threshold (lower = more permissive)
-CP_CELLPROB = 0.0       # cell probability threshold
+CP_MODEL    = "cpsam"   # Cellpose 4 model
+CP_DIAM_UM  = 5.0       # expected fiber diameter (µm)
+CP_FLOW_THR = 0.3       # flow error threshold (lower = more permissive)
+CP_CELLPROB = -1.0      # cell probability threshold (lower = more detections)
 
-# Inversion / preprocessing
-MASK_ERODE_PX          = 4    # boundary erosion depth (px)
-FADE_PX                = 8    # inward fade length (px)
-MIN_AXON_SIZE          = 40   # minimum axon blob area (px²)
-AXON_SMOOTH_SIGMA      = 1.5  # Gaussian sigma for axon perimeter smoothing (0 = off)
-AXON_DILATE_PX         = 3    # expand axon mask after convex hull (0 = off)
-AXON_MIN_MYELIN_PX     = 2    # minimum myelin ring thickness (px)
-OUTER_ERODE_PX         = 2    # erode fiber mask before morphometrics (px)
-AXON_INPUT_WHITE_POINT = 160  # clip white point of axon_input (255 = off)
+# Contrast preprocessing (applied before Cellpose only)
+CP_CLAHE        = True   # enable contrast stretch before Cellpose
+CLAHE_CLIP_LIMIT = 0.0   # 0 = stretch only; >0 = stretch + CLAHE
+CLAHE_TILE_SIZE  = (64, 64)
+STRETCH_PLOW    = 2      # low percentile for stretch
+STRETCH_PHIGH   = 98     # high percentile for stretch
 
-# QC filters  (permissive by default — clinician adjusts)
+# Inversion / preprocessing (axon_input — uses original raw image)
+MASK_ERODE_PX       = 4    # boundary erosion depth (px)
+FADE_PX             = 8    # inward fade length (px)
+MIN_AXON_SIZE       = 40   # minimum axon blob area (px²)
+AXON_SMOOTH_SIGMA   = 1.5  # Gaussian sigma for axon perimeter smoothing (0 = off)
+AXON_DILATE_PX      = 3    # expand axon mask after hull-constrained closing (0 = off)
+AXON_OPEN_PX        = 2    # morphological opening to remove thin protrusions (0 = off)
+AXON_MIN_MYELIN_PX  = 2    # hard floor: axon ≥ this many px from fiber edge
+AXON_MIN_MYELIN_FRAC = 0.30 # adaptive floor: axon ≥ frac × fiber_radius from edge
+OUTER_ERODE_PX      = 2    # erode fiber mask before morphometrics (px)
+
+# QC filters (permissive by default — adjust per study)
 MIN_GRATIO             = 0.3
 MAX_GRATIO             = 0.9
 LARGE_FIBER_MIN_GRATIO = 0.5   # g-ratio floor for large fibers
 LARGE_FIBER_PERCENTILE = 85    # "large fiber" = top 15% by fiber area
 MIN_AXON_DIAM_UM       = 0.5
 MIN_SOLIDITY           = 0.1
-MAX_SHAPE_DISCORDANCE  = 0.2   # max (fiber_solidity - axon_solidity)
+MAX_SHAPE_DISCORDANCE  = 0.2
 MAX_CENTROID_OFFSET    = 0.95
 MAX_AXON_ECCEN         = 1.0   # effectively disabled
 EXCLUDE_BORDER         = True
 
-# Isolated cluster removal
-MAIN_CLUSTER_DILATION_PX = 15  # set to 0 to disable
+# Satellite / cluster removal (skipped when fascicle mask is present)
+MIN_SATELLITE_NEIGHBORS = 15   # min neighbours within 5× fiber diam
+MIN_CLUSTER_QC_RATE     = 0.50 # clusters below this pass rate are removed
+MIN_CLUSTER_FRACTION    = 0.10 # clusters < 10% of largest cluster are removed
 ```
 
 **Tuning guide:**
 
 | Symptom | Fix |
 |---|---|
-| Cellpose over-segments large fibers | Increase `CP_DIAM_UM` |
+| Cellpose detects large non-fiber structures | Add a fascicle mask in the web UI |
 | Cellpose misses small fibers | Decrease `CP_DIAM_UM` or `CP_CELLPROB` |
-| Dark rings visible in `*_axon_input.png` | Increase `MASK_ERODE_PX` |
-| Hard edge visible at fiber boundary | Increase `FADE_PX` |
-| Too many rejected fibers | Loosen QC thresholds in `config.py` |
-| Parasitic fiber clusters outside nerve | Increase `MAIN_CLUSTER_DILATION_PX` |
-| Want to re-run axon detection only | Delete `*_axon_inner.npy` |
-| Want to re-run everything | Delete `*_cellpose_outer.npy` |
+| Cellpose over-segments | Increase `CP_DIAM_UM` or `CP_FLOW_THR` |
+| Dark rings in `*_axon_input.png` | Increase `MASK_ERODE_PX` |
+| Hard edge at fiber boundary | Increase `FADE_PX` |
+| Too many QC rejections | Loosen thresholds in `config.py` |
+| Re-run axon detection only | Delete `*_axon_inner.npy` |
+| Re-run Cellpose only | Delete `*_cellpose_outer.npy` |
+| Re-run everything | Delete both caches above |
 
 ---
 
@@ -533,35 +453,27 @@ For each input image `Foo.tif`, results are saved in `output/Foo/`:
 
 | File | Description |
 |---|---|
-| `Foo_cellpose_outer.npy` | Cellpose pass-1 label array **(cache)** |
+| `Foo_cellpose_outer.npy` | Cellpose fiber label array **(cache)** |
 | `Foo_axon_inner.npy` | Axon detection label array **(cache)** |
 | `Foo_multicore_labels.npy` | Fiber IDs flagged as multicore **(cache)** |
+| `Foo_fascicle_mask.npy` | Auto-computed fascicle mask |
+| `Foo_fascicle_mask_edited.npy` | Manual fascicle mask (drawn in web UI) — takes priority |
+| `Foo_raw.png` | Raw input image cached as PNG |
 | `Foo_axon_input.png` | Normalized-inverted debug image (axon=dark, myelin=bright) |
-| `Foo_overlay.png` | Full-resolution colour-coded overlay with legend |
+| `Foo_overlay.png` | Full-resolution colour-coded overlay |
 | `Foo_numbered.png` | Overlay with numbered QC-passed axons + stats banner |
 | `Foo_gratio_map.png` | Per-axon g-ratio heatmap (RdYlGn) |
 | `Foo_dashboard.png` | Morphometry dashboard |
 | `Foo_morphometrics.csv` | Per-axon measurements (QC-passed only) |
 | `Foo_morphometrics.xlsx` | Same as CSV in Excel format |
 | `Foo_aggregate.csv` | Image-level aggregates (AVF, MVF, N-ratio, density, mean g-ratio) |
+| `Foo_exclusion_mask.npy` | User-drawn exclusion zones (artefacts, tears) |
+| `Foo_edits.json` | Manual edit history (deleted/added fibers) |
+| `Foo_outer_edited.npy` | Corrected prediction: Cellpose + deletions/modifications (no additions) |
+| `Foo_outer_gt.npy` | Ground truth: Cellpose + deletions/modifications + manual additions |
+| `Foo_axon_inner_original.npy` | Backup of axon labels before editing |
 
 A global `output/summary.csv` collects aggregate metrics across all images.
-
-### Morphometrics CSV columns
-
-| Column | Unit | Description |
-|---|---|---|
-| `axon_diam` | µm | Axon equivalent circle diameter |
-| `fiber_diam` | µm | Fiber (axon + myelin) ECD |
-| `gratio` | — | g-ratio = axon_diam / fiber_diam |
-| `myelin_thickness` | µm | (fiber_diam − axon_diam) / 2 |
-| `axon_area` | µm² | Axon cross-sectional area |
-| `fiber_area` | µm² | Fiber cross-sectional area |
-| `solidity` | — | Axon blob solidity (0–1) |
-| `eccentricity` | — | Axon blob eccentricity (0 = circle, 1 = line) |
-| `centroid_offset` | — | Normalised axon–fiber centroid displacement |
-| `x0`, `y0` | px | Axon centroid coordinates (image space) |
-| `image_border_touching` | bool | True if fiber touches image edge |
 
 ---
 
@@ -570,16 +482,17 @@ A global `output/summary.csv` collects aggregate metrics across all images.
 ```
 hybrid-axon-seg/
 ├── segment.py          # Entry point — process_image() + main()
-├── app.py              # Web validation UI (FastAPI) — manual correction + recompute
+├── app.py              # Web validation UI (FastAPI) — fascicle drawing, correction, recompute
 ├── config.py           # All tunable parameters
-├── utils.py            # Image type conversion + font loading
+├── utils.py            # Image type conversion, font loading, satellite/cluster detection
 ├── preprocessing.py    # Per-fiber normalized inversion → axon_input
-├── detection.py        # Cellpose pass 1 + Otsu axon detection
+├── detection.py        # Cellpose pass 1 (with stretch preprocessing) + Otsu axon detection
 ├── morphometrics.py    # Per-fiber geometry + aggregate metrics
 ├── qc.py               # QC filters with rejection reason tracking
 ├── visualization.py    # Overlay, numbered image, g-ratio map, dashboard
-├── compare.py          # Group comparison dashboard (L vs R, or custom groups)
-└── test_one.py         # Single-image test runner
+├── compare.py          # Group comparison dashboard
+├── clean_output.py     # Remove generated files (keep fascicle masks + raws)
+└── static/             # Web UI assets (app.js, style.css, index.html)
 ```
 
 **Data flow:**
@@ -587,20 +500,19 @@ hybrid-axon-seg/
 ```
 img (TIFF)
   │
-  ├── [detection.py]      run_cellpose_fibers()  →  outer_labels
-  │                       _keep_main_cluster()   →  outer_labels (cleaned)
+  ├── [detection.py]      _clahe_preprocess()    →  img_stretched (Cellpose only)
+  │                       run_cellpose_fibers()  →  outer_labels  (cached)
+  │                       satellite/cluster removal
   │
-  ├── [preprocessing.py]  build_axon_input()     →  axon_input  →  *_axon_input.png
+  ├── [preprocessing.py]  build_axon_input(img)  →  axon_input  (uses raw img)
+  │                                                 saved as *_axon_input.png
   │
   ├── [detection.py]      find_axons()           →  axon_assignments
-  │                                                 { fiber_label → (r0, c0, crop_bool) }
   │
-  ├── [morphometrics.py]  process_fibers()       →  inner_labels
-  │                                                 df_all (per-fiber measurements)
-  │                                                 index_image, agg
+  ├── [morphometrics.py]  process_fibers()       →  inner_labels, df_all
+  │                       compute_aggregate()    →  agg (nratio, avf, mvf, …)
   │
   ├── [qc.py]             apply_qc()             →  df_pass, df_rej
-  │                                                 (df_rej has reject_reason column)
   │
   └── [visualization.py]  make_overlay()         →  *_overlay.png
                           make_numbered()        →  *_numbered.png
@@ -633,7 +545,7 @@ img (TIFF)
 **Other:**
 ```
   █  Red     #DC3232  No axon detected  — Otsu found no dark blob in this fiber
-  ─  White            Fascicle boundary — estimated nerve cross-section envelope
+  ─  White            Fascicle boundary — manual or auto-computed envelope
 ```
 
 ---

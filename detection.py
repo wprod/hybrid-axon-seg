@@ -136,33 +136,58 @@ def find_axons(axon_input: np.ndarray, outer_labels: np.ndarray) -> tuple[dict, 
             rprops = measure.regionprops(labeled)
             best = labeled == max(rprops, key=lambda r: r.area).label
 
-        # Large closing bridges C-shape gaps without fully simplifying the shape,
-        # then clip to minimum myelin margin from the fiber boundary
+        # Adaptive minimum myelin margin: the axon must stay at least this many
+        # pixels away from the outer fiber boundary at every point.
+        # The margin scales with fiber size so that large (thick-myelin) fibers
+        # have a proportionally larger mandatory gap.
         dist = ndimage.distance_transform_edt(p.image).astype(np.float32)
-        margin_mask = dist > config.AXON_MIN_MYELIN_PX
-        best = morphology.binary_closing(best, morphology.disk(8)) & margin_mask
+        fiber_radius_px = float(np.sqrt(p.area / np.pi))
+        adaptive_min_px = max(
+            float(config.AXON_MIN_MYELIN_PX),
+            getattr(config, "AXON_MIN_MYELIN_FRAC", 0.15) * fiber_radius_px,
+        )
+        margin_mask = dist > adaptive_min_px
+
+        # Closing fills C-shape gaps, but unconstrained it pushes the blob
+        # toward the nearest fiber edge.  Intersecting with the convex hull
+        # keeps the gap-filling while preventing outward extension.
+        try:
+            hull = morphology.convex_hull_image(best)
+            closed = morphology.binary_closing(best, morphology.disk(6))
+            best = (closed & hull) & margin_mask
+        except Exception:
+            best = morphology.binary_closing(best, morphology.disk(3)) & margin_mask
         best = ndimage.binary_fill_holes(best) & margin_mask
 
         # Smooth perimeter: Gaussian blur on the float mask, re-threshold at 0.5
+        # Re-apply margin_mask: smoothing can blur the axon edge outward.
         if config.AXON_SMOOTH_SIGMA > 0:
             best = (
                 ndimage.gaussian_filter(best.astype(np.float32), sigma=config.AXON_SMOOTH_SIGMA)
                 >= 0.5
-            ) & p.image
+            ) & margin_mask
 
         # Expand axon mask to compensate for Otsu under-segmentation at axon/myelin boundary.
         # Dilation is adaptive: small fibers (L, ~18 px radius) receive the full correction
         # because the fixed-pixel Otsu error represents a larger fraction of their radius.
         # Large fibers (R, ~39 px radius) receive a reduced correction.
         # Threshold: 25 px radius ≈ 4.5 µm diameter @ 0.09 µm/px.
+        # Re-apply margin_mask after dilation: hard guarantee that axon never touches myelin.
         if config.AXON_DILATE_PX > 0:
-            fiber_radius_px = float(np.sqrt(p.area / np.pi))
             dil_px = (
                 config.AXON_DILATE_PX
                 if fiber_radius_px < 25
                 else max(1, config.AXON_DILATE_PX // 2)
             )
-            best = morphology.binary_dilation(best, morphology.disk(dil_px)) & p.image
+            best = morphology.binary_dilation(best, morphology.disk(dil_px)) & margin_mask
+
+        # Morphological opening: erode then re-dilate.
+        # Erosion removes thin protrusions/notches that reach the fiber boundary;
+        # re-dilation restores the main body. Has no effect on smooth convex shapes.
+        # Final & margin_mask ensures the re-dilation never crosses back into the gap.
+        open_px = getattr(config, "AXON_OPEN_PX", 0)
+        if open_px > 0:
+            best = morphology.binary_opening(best, morphology.disk(open_px)) & margin_mask
 
         if best.sum() < config.MIN_AXON_SIZE:
             continue

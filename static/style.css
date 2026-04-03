@@ -23,10 +23,17 @@ header{background:var(--bg3);border-bottom:1px solid var(--brd);
 .sep{width:1px;height:22px;background:var(--brd);margin:0 2px}
 
 /* Mode buttons */
-.mode-btn{padding:5px 12px;border:1px solid var(--brd);background:var(--bg2);
-  color:var(--txt);border-radius:4px;cursor:pointer;font-size:12px;transition:all .15s}
+.mode-btn{padding:4px 9px;border:1px solid var(--brd);background:var(--bg2);
+  color:var(--txt);border-radius:4px;cursor:pointer;font-size:11px;transition:all .15s}
 .mode-btn:hover:not(.active){background:var(--brd)}
 .mode-btn.active{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}
+/* Color-coded active states */
+[data-mode="paint-axon"].active{background:var(--green);color:#000;border-color:var(--green)}
+[data-mode="paint-outer"].active{background:#9b59b6;color:#fff;border-color:#9b59b6}
+[data-mode="erase-outer"].active{background:var(--red);color:#fff;border-color:var(--red)}
+[data-mode="fascicle"].active{background:#F1C40F;color:#000;border-color:#F1C40F}
+[data-mode="exclude"].active{background:#E67E22;color:#fff;border-color:#E67E22}
+.sep-sm{width:1px;height:16px;background:var(--brd);margin:0 1px}
 
 /* Action buttons */
 .action{padding:5px 12px;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:600}
@@ -68,7 +75,7 @@ main{flex:1;display:flex;overflow:hidden}
 
 /* ── Viewer ────────────────────────────────────────────────────────────── */
 #viewer{flex:1;position:relative;overflow:hidden;background:#0a0c0f}
-#canvas{display:block;width:100%;height:100%}
+#canvas{display:block;width:100%;height:100%;touch-action:none}
 .hint{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
   color:var(--muted);font-size:13px}
 .hidden{display:none!important}
@@ -84,6 +91,10 @@ main{flex:1;display:flex;overflow:hidden}
 #viewer.mode-delete #canvas{cursor:crosshair}
 #viewer.mode-fiber #canvas{cursor:crosshair}
 #viewer.mode-fascicle #canvas{cursor:crosshair}
+#viewer.mode-paint-axon #canvas{cursor:crosshair}
+#viewer.mode-paint-outer #canvas{cursor:crosshair}
+#viewer.mode-erase-outer #canvas{cursor:crosshair}
+#viewer.mode-exclude #canvas{cursor:crosshair}
 #viewer.mode-navigate #canvas{cursor:grab}
 #viewer.panning #canvas{cursor:grabbing}
 
@@ -102,6 +113,12 @@ main{flex:1;display:flex;overflow:hidden}
 /* ── Batch progress ───────────────────────────────────────────────────── */
 .batch-progress{font-size:11px;color:var(--accent);font-weight:600;white-space:nowrap}
 
+/* ── Operation queue progress bar ─────────────────────────────────────── */
+#op-bar{position:absolute;top:0;left:0;right:0;height:3px;z-index:6;pointer-events:none}
+#op-bar-fill{height:100%;width:0;background:var(--accent);opacity:1}
+#queue-status{font-size:11px;font-weight:600;font-variant-numeric:tabular-nums;
+  transition:color .2s}
+
 /* ── Opacity slider ────────────────────────────────────────────────────── */
 .opacity-ctrl{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--muted);white-space:nowrap;user-select:none}
 .opacity-ctrl input[type=range]{width:72px;accent-color:var(--accent);cursor:pointer;height:3px}
@@ -116,3 +133,19 @@ main{flex:1;display:flex;overflow:hidden}
 .toast.info{background:var(--accent);color:#000}
 .toast.marie-toast{background:linear-gradient(135deg,#e91e8c,#9c27b0);color:#fff;font-size:13px;letter-spacing:.3px}
 @keyframes tIn{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}
+
+/* ── Panel flash on recompute ──────────────────────────────────────────────── */
+#panel.flash{animation:panelFlash .7s ease}
+@keyframes panelFlash{0%,100%{background:var(--bg2)}50%{background:#1e3a2f}}
+
+/* ── Touch / tablet ───────────────────────────────────────────────────────── */
+@media (pointer: coarse) {
+  .mode-btn{padding:8px 13px;font-size:13px}
+  .action{padding:8px 16px;font-size:13px}
+  .nav-group button{width:36px;height:36px;font-size:13px}
+  .view-btn{padding:7px 12px;font-size:12px}
+  header{padding:8px 12px;gap:8px;flex-wrap:wrap}
+  #sidebar{width:180px;min-width:140px}
+  #panel{width:220px;min-width:180px}
+  #img-list li{padding:10px 12px;font-size:12px}
+}

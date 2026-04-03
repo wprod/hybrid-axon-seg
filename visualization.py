@@ -21,7 +21,6 @@ import pandas as pd
 from matplotlib import cm
 from matplotlib.colors import Normalize
 from PIL import Image, ImageDraw
-from skimage import morphology
 from skimage.segmentation import find_boundaries
 
 import config
@@ -266,17 +265,14 @@ def make_overlay(
     _blend(pass_myel, [50, 50, 240])
     _blend(pass_axon, [0, 210, 60])
 
-    outer_c = morphology.binary_dilation(
-        find_boundaries(outer_labels, mode="thick"), morphology.disk(1)
-    )
-    inner_c_thin = find_boundaries(inner_labels, mode="thick")
+    # 1-px boundaries: mode="inner" sits just inside each labelled region
+    outer_c = find_boundaries(outer_labels, mode="inner")
+    inner_c = find_boundaries(inner_labels, mode="inner")
 
     overlay[outer_c] = [70, 70, 220]
 
     # Green contour only for passed axons
-    pass_c = morphology.binary_dilation(
-        inner_c_thin & np.isin(inner_labels, list(pass_fibers)), morphology.disk(1)
-    )
+    pass_c = inner_c & np.isin(inner_labels, list(pass_fibers))
     overlay[pass_c] = [0, 240, 80]
 
     # Rejected axon contours: per-reason color
@@ -284,15 +280,9 @@ def make_overlay(
         for reason, sub in df_rej.groupby("reject_reason"):
             lbls = set(sub["_fiber_label"].tolist())
             clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
-            rej_c = morphology.binary_dilation(
-                inner_c_thin & np.isin(inner_labels, list(lbls)), morphology.disk(1)
-            )
-            overlay[rej_c] = clr
+            overlay[inner_c & np.isin(inner_labels, list(lbls))] = clr
     else:
-        rej_c = morphology.binary_dilation(
-            inner_c_thin & np.isin(inner_labels, list(rej_fibers)), morphology.disk(1)
-        )
-        overlay[rej_c] = [255, 140, 0]
+        overlay[inner_c & np.isin(inner_labels, list(rej_fibers))] = [255, 140, 0]
 
     # ── PIL layer ─────────────────────────────────────────────────────────
     pil = Image.fromarray(overlay)
@@ -631,9 +621,15 @@ def make_dashboard(
             ["— multi-core", str(n_multicore)],
             ["— no axon", str(n_no_axon)],
             ["Nerve area (mm²)", f"{agg.get('nerve_area_mm2', 0):.4f}"],
-            ["Total myelin area (mm²)", f"{agg.get('total_myelin_area_mm2', 0):.4f}"],
-            ["Total axon area (mm²)", f"{agg.get('total_axon_area_mm2', 0):.4f}"],
-            ["N-ratio  (fibers / nerve)", f"{agg.get('nratio', 0):.4f}"],
+            *(
+                [["— exclusion (mm²)", f"{agg['exclusion_area_mm2']:.4f}"]]
+                if agg.get("exclusion_area_mm2", 0) > 0
+                else []
+            ),
+            ["Total fiber area (mm²)", f"{agg.get('total_fiber_area_mm2', 0):.4f}"],
+            ["— myelin (mm²)", f"{agg.get('total_myelin_area_mm2', 0):.4f}"],
+            ["— axon (mm²)", f"{agg.get('total_axon_area_mm2', 0):.4f}"],
+            ["N-ratio  (all fibers / nerve)", f"{agg.get('nratio', 0):.4f}"],
             ["Aggregate G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
             ["AVF  (axon volume fraction)", f"{agg.get('avf', 0):.4f}"],
             ["MVF  (myelin volume fraction)", f"{agg.get('mvf', 0):.4f}"],

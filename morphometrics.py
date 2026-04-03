@@ -110,15 +110,66 @@ def process_fibers(
     n_fail = int(outer_labels.max()) - n_ok
     print(f"       -> {n_ok} fibers with axon, {n_fail} without (shown in red)")
 
-    h, w = outer_labels.shape
-    total_um2 = h * w * pixel_size**2
-    total_axon = df["axon_area"].sum() if len(df) else 0.0
-    total_fib = df["fiber_area"].sum() if len(df) else 0.0
-    agg = {
-        "avf": total_axon / total_um2 if total_um2 else 0,
-        "mvf": (total_fib - total_axon) / total_um2 if total_um2 else 0,
-        "gratio_aggr": df["gratio"].mean() if len(df) else 0,
-        "axon_density_mm2": len(df) / (total_um2 * 1e-6) if total_um2 else 0,
-    }
+    return inner_labels, pairs, df, index_image
 
-    return inner_labels, pairs, df, index_image, agg
+
+def compute_aggregate(
+    outer_labels: np.ndarray,
+    df_pass: pd.DataFrame,
+    fascicle_mask: np.ndarray,
+    pixel_size: float,
+    group: str = "",
+    timepoint: str = "",
+    excl_mask: np.ndarray | None = None,
+) -> dict:
+    """Compute aggregate morphometry stats for one image.
+
+    Clinical logic
+    --------------
+    - **nratio** counts ALL detected fibers (pass + rejected + no-axon) because
+      every fibre physically occupies nerve cross-section regardless of health.
+    - **avf / mvf / gratio / density** use QC-passed fibers only — these
+      describe the *functional* myelinated population.
+    - Exclusion zones (artefacts, tears, folds) are subtracted from the
+      denominator so they don't dilute the ratios.
+    """
+    # ── Effective nerve area ────────────────────────────────────────────
+    full_nerve_um2 = float(fascicle_mask.sum()) * pixel_size**2
+    if excl_mask is not None:
+        excl_um2 = float((excl_mask & fascicle_mask).sum()) * pixel_size**2
+    else:
+        excl_um2 = 0.0
+    nerve_um2 = max(full_nerve_um2 - excl_um2, full_nerve_um2 * 0.01)
+
+    # ── N-ratio: ALL fibre pixels inside effective area ─────────────────
+    effective = fascicle_mask if excl_mask is None else (fascicle_mask & ~excl_mask)
+    total_fiber_um2 = float(((outer_labels > 0) & effective).sum()) * pixel_size**2
+    nratio = total_fiber_um2 / nerve_um2 if nerve_um2 else 0.0
+
+    # ── AVF / MVF / G-ratio / density: QC-passed fibres only ───────────
+    if len(df_pass) and nerve_um2:
+        total_axon_um2 = df_pass["axon_area"].sum()
+        total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
+        avf = total_axon_um2 / nerve_um2
+        mvf = total_myelin_um2 / nerve_um2
+        gratio_aggr = float(df_pass["gratio"].mean())
+        axon_density = len(df_pass) / (nerve_um2 * 1e-6)
+    else:
+        total_axon_um2 = total_myelin_um2 = 0.0
+        avf = mvf = gratio_aggr = axon_density = 0.0
+
+    return {
+        "group": group,
+        "timepoint": timepoint,
+        "n_axons": len(df_pass),
+        "nerve_area_mm2": full_nerve_um2 * 1e-6,
+        "exclusion_area_mm2": excl_um2 * 1e-6,
+        "total_fiber_area_mm2": total_fiber_um2 * 1e-6,
+        "total_axon_area_mm2": total_axon_um2 * 1e-6,
+        "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
+        "nratio": nratio,
+        "gratio_aggr": gratio_aggr,
+        "avf": avf,
+        "mvf": mvf,
+        "axon_density_mm2": axon_density,
+    }
