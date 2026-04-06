@@ -42,6 +42,7 @@ header{background:var(--bg3);border-bottom:1px solid var(--brd);
 .action.blue{background:var(--accent);color:#000}
 .action:hover{filter:brightness(1.15)}
 .action:disabled{opacity:.4;cursor:not-allowed}
+#btn-undo{background:var(--bg2);color:var(--txt);border:1px solid var(--brd)}
 
 /* View buttons */
 .view-btn{padding:5px 10px;border:1px solid var(--brd);background:var(--bg2);
@@ -138,14 +139,26 @@ main{flex:1;display:flex;overflow:hidden}
 #panel.flash{animation:panelFlash .7s ease}
 @keyframes panelFlash{0%,100%{background:var(--bg2)}50%{background:#1e3a2f}}
 
+/* ── Stale metrics (pending edits) ───────────────────────────────────────── */
+#panel.stale #tbl-metrics,
+#panel.stale #tbl-seg{opacity:.4}
+#stale-banner{display:none;text-align:center;font-size:10px;color:var(--amber);
+  padding:4px;border:1px dashed var(--amber);border-radius:4px;margin-top:6px}
+#panel.stale #stale-banner{display:block}
+
 /* ── Touch / tablet ───────────────────────────────────────────────────────── */
 @media (pointer: coarse) {
-  .mode-btn{padding:8px 13px;font-size:13px}
-  .action{padding:8px 16px;font-size:13px}
-  .nav-group button{width:36px;height:36px;font-size:13px}
-  .view-btn{padding:7px 12px;font-size:12px}
-  header{padding:8px 12px;gap:8px;flex-wrap:wrap}
-  #sidebar{width:180px;min-width:140px}
-  #panel{width:220px;min-width:180px}
+  .mode-btn{padding:7px 10px;font-size:12px}
+  .action{padding:7px 14px;font-size:12px}
+  .nav-group button{width:34px;height:34px;font-size:12px}
+  .view-btn{padding:6px 10px;font-size:11px}
+  header{padding:6px 10px;gap:6px;flex-wrap:wrap}
+  /* Hide keyboard-only shortcuts labels on touch */
+  .sep{height:18px}
+  #sidebar{width:170px;min-width:130px}
+  #panel{width:210px;min-width:170px}
   #img-list li{padding:10px 12px;font-size:12px}
+  /* Shrink opacity slider on touch */
+  .opacity-ctrl input[type=range]{width:50px}
+  #opacity-val{display:none}
 }

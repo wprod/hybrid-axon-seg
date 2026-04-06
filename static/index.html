@@ -27,6 +27,7 @@
     </div>
     <span class="sep"></span>
     <div class="toolbar">
+      <button id="btn-undo" class="action" title="Undo last edit (Ctrl+Z)">Undo</button>
       <button id="btn-recompute" class="action green">Recompute</button>
       <button id="btn-reset" class="action amber">Reset</button>
       <button id="btn-recompute-all" class="action blue" title="Recompute all images (background — app stays usable)">Recompute All</button>
@@ -72,6 +73,7 @@
     <aside id="panel">
       <h3>Clinician Metrics</h3>
       <table id="tbl-metrics"><tbody></tbody></table>
+      <div id="stale-banner">Recompute to refresh</div>
 
       <div id="fascicle-panel" class="mt hidden">
         <h3>Fascicle <span id="fasc-badge" class="badge" style="background:#F1C40F;color:#000">edited</span></h3>
@@ -95,6 +97,7 @@
         <div class="sc">F — fit to view</div>
         <div class="sc">Scroll — zoom</div>
         <div class="sc">Right-drag / Space+drag — pan</div>
+        <div class="sc">Ctrl/Cmd+Z — undo last edit</div>
         <div class="sc">Esc — cancel draw</div>
         <div class="sc" style="margin-top:6px;color:#66bb6a">5 +Green: drag lasso → fills axon (green)</div>
         <div class="sc" style="color:#9b59b6">6 +Violet: drag lasso → fills outer fiber (violet)</div>
@@ -106,6 +109,6 @@
   </main>
 
   <div id="toasts"></div>
-  <script src="/static/app.js?v=6"></script>
+  <script src="/static/app.js?v=7"></script>
 </body>
 </html>

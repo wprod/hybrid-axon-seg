@@ -12,6 +12,7 @@ Pipeline
 5. Visualizations      → overlay, numbered, g-ratio map, dashboard
 """
 
+import contextlib
 import sys
 import traceback
 import warnings
@@ -64,6 +65,123 @@ def _parse_folder(name: str) -> tuple[str, str]:
         group = name.strip()[: m.start()].strip()
         return group, timepoint
     return name.strip(), ""
+
+
+_CLINICAL_COLS = [
+    "axon_diam",
+    "fiber_diam",
+    "gratio",
+    "myelin_thickness",
+    "axon_area",
+    "fiber_area",
+    "x0",
+    "y0",
+]
+
+
+def finalize_image(
+    img: np.ndarray,
+    outer_labels: np.ndarray,
+    axon_assignments: dict,
+    multicore_labels: set,
+    stem: str,
+    out_dir: Path,
+    *,
+    group: str = "",
+    timepoint: str = "",
+    has_fascicle: bool = False,
+    fascicle_mask: np.ndarray | None = None,
+    excl_mask: np.ndarray | None = None,
+) -> tuple[str, int, dict]:
+    """Shared pipeline tail: morphometrics → QC → aggregate → CSV → visualizations.
+
+    Called by process_image() (CLI batch) and app.py (web recompute).
+    """
+    # ── Morphometrics + QC ───────────────────────────────────────────────
+    print("  Computing morphometrics…")
+    inner_labels, pairs, df_all, index_image = process_fibers(
+        outer_labels,
+        axon_assignments,
+        config.PIXEL_SIZE,
+    )
+    n_outer = int(outer_labels.max())
+    n_matched = len(pairs)
+    print(f"       → {len(df_all)} axons measured")
+
+    df_pass, df_rej = apply_qc(df_all)
+    print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
+
+    # Remove low-QC clusters — skipped when fascicle mask constrains Cellpose
+    if not has_fascicle:
+        bad_cluster_labels = find_low_qc_cluster_labels(
+            outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+        )
+        if bad_cluster_labels:
+            outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
+            inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
+
+            def keep_fibers(df):
+                return df[~df["_fiber_label"].isin(bad_cluster_labels)]
+
+            df_pass = keep_fibers(df_pass)
+            df_rej = keep_fibers(df_rej)
+            print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
+
+    # ── Fascicle mask ────────────────────────────────────────────────────
+    if fascicle_mask is None:
+        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
+
+    # ── Aggregate stats ──────────────────────────────────────────────────
+    agg = compute_aggregate(
+        outer_labels,
+        df_pass,
+        fascicle_mask,
+        config.PIXEL_SIZE,
+        group=group,
+        timepoint=timepoint,
+        excl_mask=excl_mask,
+    )
+
+    # ── Save data ────────────────────────────────────────────────────────
+    pub_cols = [c for c in _CLINICAL_COLS if c in df_pass.columns]
+    df_pass[pub_cols].to_csv(out_dir / f"{stem}_morphometrics.csv", index=False)
+    with contextlib.suppress(ImportError):
+        df_pass[pub_cols].to_excel(out_dir / f"{stem}_morphometrics.xlsx", index=False)
+    pd.DataFrame([agg]).to_csv(out_dir / f"{stem}_aggregate.csv", index=False)
+
+    # ── Visualizations ───────────────────────────────────────────────────
+    print("  Generating visualizations…")
+    overlay = make_overlay(
+        img,
+        outer_labels,
+        inner_labels,
+        df_pass,
+        df_rej,
+        multicore_labels,
+        fascicle_mask=fascicle_mask,
+    )
+    io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
+
+    numbered = make_numbered(
+        overlay, df_pass, n_outer, stem, nerve_area_mm2=agg.get("nerve_area_mm2", 0.0)
+    )
+    io.imsave(str(out_dir / f"{stem}_numbered.png"), numbered, check_contrast=False)
+
+    if getattr(config, "GRATIO_MAP", False):
+        make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")
+    make_dashboard(
+        df_pass,
+        df_rej,
+        agg,
+        n_outer,
+        n_matched,
+        stem,
+        out_dir / f"{stem}_dashboard.png",
+        n_multicore=len(multicore_labels),
+    )
+
+    return stem, len(df_pass), agg
 
 
 def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple[str, int, dict]:
@@ -240,113 +358,36 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         np.save(str(cache_axon), inner_labels_raw)
         version_file.write_text(_AXON_CACHE_VERSION)
 
-    # ── Step 3: Morphometrics + QC ────────────────────────────────────────
-    print("  Computing morphometrics…")
-    inner_labels, pairs, df_all, index_image = process_fibers(
-        outer_labels,
-        axon_assignments,
-        config.PIXEL_SIZE,
-    )
-    n_matched = len(pairs)
-    print(f"       → {len(df_all)} axons measured")
-
-    df_pass, df_rej = apply_qc(df_all)
-    print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
-
-    # Remove low-QC clusters — skipped when fascicle mask constrains Cellpose
-    if not has_fascicle:
-        bad_cluster_labels = find_low_qc_cluster_labels(
-            outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
-        )
-        if bad_cluster_labels:
-            outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
-            inner_labels = _remove_labels(inner_labels, bad_cluster_labels)
-
-            def keep_fibers(df):
-                return df[~df["_fiber_label"].isin(bad_cluster_labels)]
-
-            df_pass = keep_fibers(df_pass)
-            df_rej = keep_fibers(df_rej)
-            print(f"       → removed {len(bad_cluster_labels)} fibers in low-QC clusters")
-
-    # Fascicle mask: use manual if available, else auto-compute from labels
+    # ── Steps 3–5: shared pipeline (morphometrics → QC → viz) ──────────
+    # Load fascicle mask (manual if available, else auto-computed inside finalize)
+    fascicle_mask = None
     if has_fascicle:
-        fascicle_mask = np.load(str(fascicle_pre))
-        if fascicle_mask.shape != outer_labels.shape:
-            fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
-    else:
-        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
-    np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
+        fm = np.load(str(fascicle_pre))
+        if fm.shape == outer_labels.shape:
+            fascicle_mask = fm
 
     # Load exclusion zones (artefacts / tears drawn in the web UI)
     excl_path = out_dir / f"{stem}_exclusion_mask.npy"
     excl_mask = np.load(str(excl_path)) if excl_path.exists() else None
-    if excl_mask is not None and excl_mask.shape != fascicle_mask.shape:
+    if excl_mask is not None and excl_mask.shape != outer_labels.shape:
         excl_mask = None
 
-    # Aggregate stats — nratio uses ALL fibres, avf/mvf/density use QC-pass only
-    agg = compute_aggregate(
+    stem_out, n, agg = finalize_image(
+        img,
         outer_labels,
-        df_pass,
-        fascicle_mask,
-        config.PIXEL_SIZE,
+        axon_assignments,
+        multicore_labels,
+        stem,
+        out_dir,
         group=group,
         timepoint=timepoint,
+        has_fascicle=has_fascicle,
+        fascicle_mask=fascicle_mask,
         excl_mask=excl_mask,
     )
 
-    # ── Step 4: Save data ─────────────────────────────────────────────────
-    _CLINICAL_COLS = [
-        "axon_diam",
-        "fiber_diam",
-        "gratio",
-        "myelin_thickness",
-        "axon_area",
-        "fiber_area",
-        "x0",
-        "y0",
-    ]
-    pub_cols = [c for c in _CLINICAL_COLS if c in df_pass.columns]
-    df_pass[pub_cols].to_csv(out_dir / f"{stem}_morphometrics.csv", index=False)
-    try:
-        df_pass[pub_cols].to_excel(out_dir / f"{stem}_morphometrics.xlsx", index=False)
-    except ImportError:
-        print("       ⚠ openpyxl not installed — .xlsx skipped")
-    pd.DataFrame([agg]).to_csv(out_dir / f"{stem}_aggregate.csv", index=False)
-
-    # ── Step 5: Visualizations ────────────────────────────────────────────
-    print("  Generating visualizations…")
-    overlay = make_overlay(
-        img,
-        outer_labels,
-        inner_labels,
-        df_pass,
-        df_rej,
-        multicore_labels,
-        fascicle_mask=fascicle_mask,
-    )
-    io.imsave(str(out_dir / f"{stem}_overlay.png"), overlay, check_contrast=False)
-
-    numbered = make_numbered(
-        overlay, df_pass, n_outer, stem, nerve_area_mm2=agg.get("nerve_area_mm2", 0.0)
-    )
-    io.imsave(str(out_dir / f"{stem}_numbered.png"), numbered, check_contrast=False)
-
-    if getattr(config, "GRATIO_MAP", False):
-        make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")
-    make_dashboard(
-        df_pass,
-        df_rej,
-        agg,
-        n_outer,
-        n_matched,
-        stem,
-        out_dir / f"{stem}_dashboard.png",
-        n_multicore=len(multicore_labels),
-    )
-
     print(f"  ✓ Done — {out_dir}")
-    return stem, len(df_pass), agg
+    return stem_out, n, agg
 
 
 # ── Batch entry point ────────────────────────────────────────────────────────

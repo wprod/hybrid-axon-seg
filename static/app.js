@@ -63,6 +63,9 @@ class App {
     this._qTotal   = 0;     // ops added in current batch
     this._qDone    = 0;     // ops completed in current batch
 
+    // Touch-confirm for delete mode
+    this._delConfirm = null;
+
     // Easter egg key buffer 💙
     this._keyBuffer = '';
     this._logoClicks = 0;
@@ -74,6 +77,16 @@ class App {
   async boot() {
     this.bindEvents();
     this.bindResize();
+    // Load server config (gratio_map flag, etc.)
+    try {
+      const r = await fetch('/api/config');
+      this.serverConfig = await r.json();
+    } catch { this.serverConfig = {}; }
+    // Hide G-ratio view button if disabled server-side
+    if (!this.serverConfig.gratio_map) {
+      const btn = $('[data-view="gratio_map"]');
+      if (btn) btn.classList.add('hidden');
+    }
     await this.loadList();
     if (this.stems.length) {
       this.select(this.stems[0]);
@@ -94,6 +107,7 @@ class App {
 
   bindEvents() {
     $$('.mode-btn').forEach(b => b.onclick = () => this.setMode(b.dataset.mode));
+    $('#btn-undo').onclick = () => this.undo();
     $('#btn-recompute').onclick = () => this.recompute();
     $('#btn-reset').onclick = () => this.reset();
     $('#btn-clear-fasc').onclick = () => this.clearFascicle();
@@ -351,7 +365,8 @@ class App {
       ['Total axon area',    fmt(m.total_axon_area_mm2) + ' mm²', true],
       ['Total myelin area',  fmt(m.total_myelin_area_mm2) + ' mm²', true],
       ['N-ratio',            fmt(m.nratio),                     true],
-      ['G-ratio',            fmt(m.gratio_aggr),                true],
+      ['G-ratio (mean)',     fmt(m.gratio_aggr),                true],
+      ['G-ratio (area-w.)',  fmt(m.gratio_area_weighted),       true],
     ];
     const seg = [
       ['AVF',           fmt(m.avf)],
@@ -373,9 +388,11 @@ class App {
   }
 
   showEditCount() {
-    $('#edit-info').textContent = this.editCount
+    const stale = this.editCount > 0;
+    $('#edit-info').textContent = stale
       ? `${this.editCount} edit(s) -- recompute for metrics`
       : '';
+    $('#panel').classList.toggle('stale', stale);
   }
 
   /* ── Canvas ──────────────────────────────────────────────────────────── */
@@ -683,7 +700,24 @@ class App {
     }
 
     // Tool actions (mouse left-click or pen tap)
-    if (this.mode === 'delete') this.clickDelete(e);
+    if (this.mode === 'delete') {
+      // On touch/tablet devices (coarse pointer), require double-tap to confirm
+      const isCoarse = matchMedia('(pointer: coarse)').matches;
+      if (isCoarse) {
+        const pt = this.s2i(e);
+        const now = Date.now();
+        if (this._delConfirm && now - this._delConfirm.t < 1500 &&
+            Math.hypot(pt.x - this._delConfirm.x, pt.y - this._delConfirm.y) < 30) {
+          this._delConfirm = null;
+          this.clickDelete(e);
+        } else {
+          this._delConfirm = { x: pt.x, y: pt.y, t: now };
+          this.toast('Tap again to confirm delete', 'info');
+        }
+      } else {
+        this.clickDelete(e);
+      }
+    }
 
     // Freehand lasso modes
     if (['fiber', 'paint-axon', 'paint-outer', 'erase-outer'].includes(this.mode)) {
@@ -862,6 +896,7 @@ class App {
   onKey(e, down) {
     if (e.code === 'Space') { this.spaceHeld = down; if (down) e.preventDefault(); return; }
     if (!down) return;
+    if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); this.undo(); return; }
     if (e.key.length === 1) {
       this._keyBuffer = (this._keyBuffer + e.key.toLowerCase()).slice(-5);
       if (this._keyBuffer === 'marie') { this._keyBuffer = ''; this._marie('💙 Coucou Marie — bonne analyse !'); }
@@ -1046,6 +1081,7 @@ class App {
       this.showBusy(false);
       this.toast('Fascicle saved — click Recompute to apply', 'ok');
       this.loadFascicle(this.cur);
+      this.setMode('navigate');
     } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
   }
 
@@ -1062,6 +1098,7 @@ class App {
       this.showBusy(false);
       this.toast('Exclusion zone saved — click Recompute to apply', 'ok');
       this.loadExclusion(this.cur);
+      this.setMode('navigate');
     } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
   }
 
@@ -1102,16 +1139,35 @@ class App {
     } catch (err) { this.toast(err.message, 'err'); }
   }
 
+  async undo() {
+    if (!this.cur) return;
+    // Flush pending queue items so they don't overwrite the restored state
+    if (this._qItems.length > 0) {
+      this._qItems = [];
+      this._qDirty = false;
+      this._qBarDone();
+    }
+    try {
+      const r = await fetch(`/api/image/${this.cur}/undo`, { method: 'POST' });
+      if (!r.ok) { this.toast((await r.json()).detail || 'Nothing to undo', 'info'); return; }
+      this.toast('Undo OK', 'ok');
+      if (this.editCount > 0) this.editCount--;
+      this.anns.pop();
+      this.showEditCount();
+      this.reloadOverlay();
+    } catch (err) { this.toast(err.message, 'err'); }
+  }
+
   async recomputeAll() {
     const nProcessed = [...this.processedMap.values()].filter(Boolean).length;
-    const minsEst = Math.max(1, Math.round(nProcessed * 1.5));
+    const secsEst = Math.max(10, nProcessed * 8);
+    const timeStr = secsEst >= 60
+      ? `~${Math.round(secsEst / 60)} min`
+      : `~${secsEst} sec`;
     const msg =
-      `Recompute ${nProcessed} image(s)?\n\n` +
-      `⏱  Estimated time: ~${minsEst} min (Cellpose runs image by image)\n\n` +
-      `✅  The app stays fully usable during the computation.\n` +
-      `⚠️  Cellpose caches are NOT re-run — only morphometrics are\n` +
-      `    recomputed. To re-run Cellpose, delete the .npy caches\n` +
-      `    then launch segment.py.`;
+      `Recompute morphometrics for ${nProcessed} image(s)?\n\n` +
+      `⏱  Estimated: ${timeStr} (QC + visualisations only, no Cellpose)\n\n` +
+      `✅  The app stays fully usable during the computation.`;
     if (!confirm(msg)) return;
     const btn = $('#btn-recompute-all');
     btn.disabled = true;
