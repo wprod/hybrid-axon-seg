@@ -9,7 +9,6 @@ Color scheme
   RED                           = fiber with no axon detected (other)
 """
 
-import math
 import warnings
 
 import matplotlib
@@ -177,7 +176,8 @@ def _styled_table(ax, rows, n_pass, n_rej):
     _RED = {"— QC rejected"}
     _PURPLE = {"— multi-core"}
     _BLUE = {
-        "Aggregate G-ratio",
+        "G-ratio (mean)",
+        "G-ratio (area-weighted)",
         "AVF  (axon volume fraction)",
         "MVF  (myelin volume fraction)",
         "N-ratio  (fibers / nerve)",
@@ -249,18 +249,8 @@ def make_overlay(
     _blend(no_axon, [220, 50, 50])
     _blend(multicore_mask, [210, 50, 85])  # crimson-red (distinct from plain red)
 
-    # Rejected fibers: color per QC rejection reason
-    if len(df_rej) and "reject_reason" in df_rej.columns and "_fiber_label" in df_rej.columns:
-        for reason, sub in df_rej.groupby("reject_reason"):
-            clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
-            lbls = set(sub["_fiber_label"].tolist())
-            m_axon = np.isin(inner_labels, list(lbls)) & (inner_labels > 0)
-            m_myel = np.isin(outer_labels, list(lbls)) & ~m_axon & (inner_labels == 0)
-            _blend(m_axon, clr)
-            _blend(m_myel, clr, alpha=0.35)
-    else:
-        _blend(rej_myel, [200, 120, 30], alpha=0.35)
-        _blend(rej_axon, [255, 140, 0])
+    _blend(rej_myel, [200, 120, 30], alpha=0.35)
+    _blend(rej_axon, [255, 140, 0])
 
     _blend(pass_myel, [50, 50, 240])
     _blend(pass_axon, [0, 210, 60])
@@ -275,88 +265,25 @@ def make_overlay(
     pass_c = inner_c & np.isin(inner_labels, list(pass_fibers))
     overlay[pass_c] = [0, 240, 80]
 
-    # Rejected axon contours: per-reason color
-    if len(df_rej) and "reject_reason" in df_rej.columns and "_fiber_label" in df_rej.columns:
-        for reason, sub in df_rej.groupby("reject_reason"):
-            lbls = set(sub["_fiber_label"].tolist())
-            clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
-            overlay[inner_c & np.isin(inner_labels, list(lbls))] = clr
-    else:
-        overlay[inner_c & np.isin(inner_labels, list(rej_fibers))] = [255, 140, 0]
+    overlay[inner_c & np.isin(inner_labels, list(rej_fibers))] = [255, 140, 0]
 
-    # ── PIL layer ─────────────────────────────────────────────────────────
+    # ── PIL layer — legend only (no per-fiber badges) ─────────────────────
     pil = Image.fromarray(overlay)
     draw = ImageDraw.Draw(pil)
-    font_code = load_font(12)
     font_leg = load_font(13)
 
-    # Rejection badges: dark pill with orange border + yellow text
-    PAD = 4
-    if len(df_rej) and "reject_reason" in df_rej.columns:
-        for _, row in df_rej.iterrows():
-            reason = str(row.get("reject_reason", ""))
-            if not reason:
-                continue
-            x, y = int(row["x0"]), int(row["y0"])
-            tx, ty = x - 7, y - 8
-            bb = draw.textbbox((tx, ty), reason, font=font_code)
-            draw.rectangle(
-                [bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD],
-                fill=(25, 15, 0),
-                outline=(255, 160, 30),
-                width=1,
-            )
-            draw.text((tx, ty), reason, fill=(255, 225, 80), font=font_code)
-
-    # Multi-core badges: crimson pill with "MC" label
-    if mc_fibers:
-        from skimage import measure as _measure
-
-        for p in _measure.regionprops(outer_labels):
-            if p.label not in mc_fibers:
-                continue
-            cy, cx = int(p.centroid[0]), int(p.centroid[1])
-            tx, ty = cx - 7, cy - 8
-            bb = draw.textbbox((tx, ty), "MC", font=font_code)
-            draw.rectangle(
-                [bb[0] - PAD, bb[1] - PAD, bb[2] + PAD, bb[3] + PAD],
-                fill=(60, 10, 20),
-                outline=(210, 50, 85),
-                width=1,
-            )
-            draw.text((tx, ty), "MC", fill=(255, 180, 190), font=font_code)
-
-    # ── Legend (dynamic: one entry per rejection reason present) ──────────
-    present_reasons = (
-        sorted(df_rej["reject_reason"].dropna().unique())
-        if len(df_rej) and "reject_reason" in df_rej.columns
-        else []
-    )
     entries = [
         ([0, 210, 60], "Axon — QC passed"),
         ([50, 50, 240], "Myelin — QC passed"),
-    ]
-    for reason in present_reasons:
-        clr = list(_REJ_COLORS.get(reason, (255, 140, 0)))
-        entries.append((clr, _REJ_LABELS.get(reason, f"Rejected: {reason}")))
-    if not present_reasons:
-        entries.append(([255, 140, 0], "Detected — QC rejected"))
-    entries.append(([210, 50, 85], "MC — Multi-core (excluded)"))
-    entries.append(([220, 50, 50], "No axon found"))
-
-    codes = [
-        "QC rejection codes:",
-        "G = g-ratio    Ø = diam.    sol = solidity",
-        "ecc = eccentr.  off = offset  brd = border",
-        "lgG = large fiber (P85+) + G < 0.5",
-        "shp = axon shape ≠ fiber shape",
+        ([255, 140, 0], "Detected — QC rejected"),
+        ([210, 50, 85], "Multi-core (excluded)"),
+        ([220, 50, 50], "No axon found"),
     ]
 
     ENTRY_H = 24
-    CODE_H = 16
     lx = 18
-    lw = 325
-    lh = 12 + len(entries) * ENTRY_H + 10 + len(codes) * CODE_H + 8
+    lw = 280
+    lh = 12 + len(entries) * ENTRY_H + 8
     _, H = pil.width, pil.height
     ly = H - lh - 10
 
@@ -377,15 +304,6 @@ def make_overlay(
         draw.ellipse([cx_sw - 7, cy_sw - 7, cx_sw + 7, cy_sw + 7], fill=tuple(color))
         draw.text((lx + 34, y_cur), label, fill=(230, 230, 230), font=font_leg)
         y_cur += ENTRY_H
-
-    draw.line([lx + 10, y_cur, lx + lw - 10, y_cur], fill=(70, 70, 80), width=1)
-    y_cur += 8
-
-    for i, line in enumerate(codes):
-        clr = (210, 210, 220) if i == 0 else (150, 150, 160)
-        fnt = load_font(11) if i > 0 else load_font(12)
-        draw.text((lx + 12, y_cur), line, fill=clr, font=fnt)
-        y_cur += CODE_H
 
     return np.array(pil)
 
@@ -483,9 +401,9 @@ def make_dashboard(
     out_path,
     n_multicore: int = 0,
 ) -> None:
-    """Save a 2×3 publication-quality morphometry dashboard."""
+    """Save a 2×4 publication-quality morphometry dashboard."""
     with plt.rc_context(_DASH_STYLE):
-        fig = plt.figure(figsize=(20, 11), facecolor=_CLR["bg"])
+        fig = plt.figure(figsize=(24, 11), facecolor=_CLR["bg"])
         fig.suptitle(
             f"Nerve Morphometry  —  {stem}",
             fontsize=15,
@@ -495,27 +413,34 @@ def make_dashboard(
         )
 
         gs = fig.add_gridspec(
-            2, 3, hspace=0.42, wspace=0.35, left=0.06, right=0.97, top=0.93, bottom=0.07
+            2, 4, hspace=0.42, wspace=0.35, left=0.05, right=0.97, top=0.93, bottom=0.07
         )
-        axes = [[fig.add_subplot(gs[r, c]) for c in range(3)] for r in range(2)]
 
         has_g = "gratio" in df.columns and len(df) > 0
         norm_g = Normalize(vmin=config.MIN_GRATIO, vmax=config.MAX_GRATIO)
         cmap_g = matplotlib.colormaps["RdYlGn"]
 
-        # ── row 0: histograms ─────────────────────────────────────────────
+        # ── row 0: histograms (4 panels) ─────────────────────────────────
+        ax_h = [fig.add_subplot(gs[0, c]) for c in range(4)]
         _hist_with_stats(
-            axes[0][0], df["axon_diam"], _CLR["axon"], "Axon diameter (µm)", "Axon diameter"
+            ax_h[0], df["axon_diam"], _CLR["axon"], "Axon diameter (µm)", "Axon diameter"
         )
         _hist_with_stats(
-            axes[0][1],
-            df["gratio"] if has_g else pd.Series(dtype=float),
+            ax_h[1],
+            df["fiber_diam"] if "fiber_diam" in df.columns else pd.Series(dtype=float),
             _CLR["myelin"],
+            "Fiber diameter (µm)",
+            "Fiber diameter",
+        )
+        _hist_with_stats(
+            ax_h[2],
+            df["gratio"] if has_g else pd.Series(dtype=float),
+            "#2980B9",
             "G-ratio",
             "G-ratio",
         )
         _hist_with_stats(
-            axes[0][2],
+            ax_h[3],
             df["myelin_thickness"] if "myelin_thickness" in df.columns else pd.Series(dtype=float),
             "#8E44AD",
             "Myelin thickness (µm)",
@@ -524,15 +449,18 @@ def make_dashboard(
 
         # reference line on g-ratio histogram
         if has_g:
-            axes[0][1].axvline(
+            ax_h[2].axvline(
                 0.6, color=_CLR["rej"], lw=1.2, ls="-.", label="optimal ≈ 0.6", zorder=3
             )
-            axes[0][1].legend(loc="upper right")
+            ax_h[2].legend(loc="upper right")
 
         # ── row 1: scatter + table ────────────────────────────────────────
+        ax_s0 = fig.add_subplot(gs[1, 0])
+        ax_s1 = fig.add_subplot(gs[1, 1])
+
         if has_g:
             _scatter_colored(
-                axes[1][0],
+                ax_s0,
                 x=df["axon_diam"].values,
                 y=df["gratio"].values,
                 c=df["gratio"].values,
@@ -544,13 +472,13 @@ def make_dashboard(
                 ref_line=0.6,
             )
         else:
-            axes[1][0].set(
+            ax_s0.set(
                 xlabel="Axon diameter (µm)", ylabel="G-ratio", title="G-ratio vs. Axon diameter"
             )
 
         if "myelin_thickness" in df.columns and len(df):
             _scatter_colored(
-                axes[1][1],
+                ax_s1,
                 x=df["axon_diam"].values,
                 y=df["myelin_thickness"].values,
                 c=df["myelin_thickness"].values,
@@ -564,14 +492,14 @@ def make_dashboard(
                 title="Myelin thickness vs. Axon diameter",
             )
         else:
-            axes[1][1].set(
+            ax_s1.set(
                 xlabel="Axon diameter (µm)",
                 ylabel="Myelin thickness (µm)",
                 title="Myelin thickness vs. Axon diameter",
             )
 
         # ── right panel: rejection breakdown + metrics table ──────────────
-        ax_right = axes[1][2]
+        ax_right = fig.add_subplot(gs[1, 2:])
         ax_right.axis("off")
         ax_right.set_title(
             "Segmentation quality", pad=8, fontsize=11, fontweight="bold", color=_CLR["text"]
@@ -629,14 +557,14 @@ def make_dashboard(
             ["Total fiber area (mm²)", f"{agg.get('total_fiber_area_mm2', 0):.4f}"],
             ["— myelin (mm²)", f"{agg.get('total_myelin_area_mm2', 0):.4f}"],
             ["— axon (mm²)", f"{agg.get('total_axon_area_mm2', 0):.4f}"],
-            ["N-ratio  (all fibers / nerve)", f"{agg.get('nratio', 0):.4f}"],
-            ["Aggregate G-ratio", f"{agg.get('gratio_aggr', 0):.4f}"],
+            ["N-ratio  (fibers / nerve)", f"{agg.get('nratio', 0):.4f}"],
+            ["G-ratio (mean)", f"{agg.get('gratio_aggr', 0):.4f}"],
+            ["G-ratio (area-weighted)", f"{agg.get('gratio_area_weighted', 0):.4f}"],
             ["AVF  (axon volume fraction)", f"{agg.get('avf', 0):.4f}"],
             ["MVF  (myelin volume fraction)", f"{agg.get('mvf', 0):.4f}"],
             ["Axon density (mm⁻²)", f"{agg.get('axon_density_mm2', 0):.0f}"],
             ["Mean axon diameter", f"{df['axon_diam'].mean():.2f} µm" if len(df) else "—"],
             ["Mean fiber diameter", f"{df['fiber_diam'].mean():.2f} µm" if len(df) else "—"],
-            ["Mean G-ratio", f"{df['gratio'].mean():.3f}" if has_g else "—"],
         ]
         inset_tbl = ax_right.inset_axes([0.0, 0.0, 1.0, 0.53])
         _styled_table(inset_tbl, tbl_rows, len(df), len(df_rej))
@@ -646,206 +574,3 @@ def make_dashboard(
 
 
 # ── Multi-image comparison ────────────────────────────────────────────────────
-
-
-def _detect_group(name: str) -> str:
-    """Extract a study-group label from an image stem/filename."""
-    import re
-
-    _KNOWN = [
-        (re.compile(r"^BMSC", re.I), "BMSC"),
-        (re.compile(r"^OSC", re.I), "OSC"),
-        (re.compile(r"^Autob", re.I), "Autob"),
-        (re.compile(r"^Allo", re.I), "Allo"),
-    ]
-    for pat, label in _KNOWN:
-        if pat.match(name):
-            return label
-    # Generic fallback: leading alpha token
-    m = re.match(r"^([A-Za-z]+)", name)
-    return m.group(1) if m else "Other"
-
-
-def make_comparison(results: list[dict], out_path) -> None:
-    """Save a group × timepoint comparison figure (mean ± SD + individual dots).
-
-    Groups and timepoints are read from the ``group`` / ``timepoint`` fields
-    injected by the pipeline.  Falls back to filename-based auto-detection when
-    those fields are absent or empty.
-
-    Layout: 2 × 3 metric panels.  Each panel shows one bar cluster per group,
-    with one bar per timepoint (side-by-side, coloured by timepoint).
-    Individual animal data points are overlaid as jittered dots.
-    """
-    from collections import defaultdict
-
-    if not results:
-        return
-
-    # ── Resolve groups and timepoints ────────────────────────────────────
-    def _g(r):
-        g = r.get("group", "")
-        g = "" if (g is None or (isinstance(g, float) and math.isnan(g))) else str(g).strip()
-        return g if g else _detect_group(r.get("image", ""))
-
-    def _tp(r):
-        tp = r.get("timepoint", "")
-        tp = "" if (tp is None or (isinstance(tp, float) and math.isnan(tp))) else str(tp).strip()
-        return tp
-
-    # Stable insertion-order lists
-    groups: list[str] = []
-    timepoints: list[str] = []
-    for r in results:
-        g, tp = _g(r), _tp(r)
-        if g and g not in groups:
-            groups.append(g)
-        if tp and tp not in timepoints:
-            timepoints.append(tp)
-
-    groups = sorted(groups)
-    timepoints = sorted(timepoints)  # e.g. ["12w", "16w"]
-    n_groups = len(groups)
-    n_tp = max(len(timepoints), 1)
-
-    # ── Build lookup (group, timepoint) → [values] ───────────────────────
-    data: dict[tuple, list] = defaultdict(list)
-    for r in results:
-        data[(_g(r), _tp(r))].append(r)
-
-    # ── Colors ───────────────────────────────────────────────────────────
-    _TP_COLORS = ["#3498DB", "#E67E22", "#27AE60", "#8E44AD"]
-    tp_color = {tp: _TP_COLORS[i % len(_TP_COLORS)] for i, tp in enumerate(timepoints)}
-    if not timepoints:
-        # Single-timepoint fallback: one color per group
-        cmap_g = matplotlib.colormaps["Set2"]
-        grp_color = {g: cmap_g(i / max(n_groups, 1)) for i, g in enumerate(groups)}
-
-    # ── Metrics ──────────────────────────────────────────────────────────
-    _metrics = [
-        ("nerve_area_mm2", "Nerve area", "mm²", None),
-        ("n_axons", "N axons", "", None),
-        ("nratio", "N-ratio", "", None),
-        ("total_axon_area_mm2", "Axon area", "mm²", None),
-        ("total_myelin_area_mm2", "Myelin area", "mm²", None),
-        ("gratio_aggr", "G-ratio", "", 0.60),
-    ]
-
-    x_pos = np.arange(n_groups)
-    bw = 0.80 / max(n_tp, 1)  # bar width
-    rng = np.random.default_rng(42)
-
-    with plt.rc_context(_DASH_STYLE):
-        fig = plt.figure(figsize=(max(16, n_groups * 1.6), 10), facecolor=_CLR["bg"])
-        tp_str = " · ".join(timepoints) if timepoints else "all"
-        fig.suptitle(
-            f"Group Comparison  ·  {len(results)} images  ·  {tp_str}",
-            fontsize=15,
-            weight="bold",
-            color=_CLR["text"],
-            y=0.99,
-        )
-        gs = fig.add_gridspec(
-            2,
-            3,
-            hspace=0.55,
-            wspace=0.40,
-            left=0.07,
-            right=0.97,
-            top=0.92,
-            bottom=0.10,
-        )
-
-        for idx, (col, title, unit_lbl, ref) in enumerate(_metrics):
-            ax = fig.add_subplot(gs[idx // 3, idx % 3])
-            all_vals_flat: list[float] = []
-
-            tp_iter = timepoints if timepoints else [""]
-            for ti, tp in enumerate(tp_iter):
-                offset = (ti - (n_tp - 1) / 2) * bw
-                color = tp_color.get(tp) if timepoints else None
-
-                for gi, g in enumerate(groups):
-                    key = (g, tp)
-                    recs = data[key]
-                    vals = [float(r.get(col) or 0) for r in recs]
-                    if not vals:
-                        continue
-                    all_vals_flat.extend(vals)
-                    mean_v = float(np.mean(vals))
-                    std_v = float(np.std(vals, ddof=0))
-                    bar_color = color if color else grp_color.get(g, "#888")
-
-                    ax.bar(
-                        gi + offset,
-                        mean_v,
-                        yerr=std_v,
-                        width=bw * 0.88,
-                        color=bar_color,
-                        alpha=0.82,
-                        capsize=4,
-                        error_kw={"linewidth": 1.5, "capthick": 1.5},
-                        edgecolor="white",
-                        linewidth=0.3,
-                        zorder=2,
-                        label=tp if (gi == 0 and timepoints) else "_nolegend_",
-                    )
-                    # Individual dots
-                    if len(vals) > 1:
-                        jitter = rng.uniform(-bw * 0.22, bw * 0.22, len(vals))
-                        ax.scatter(
-                            gi + offset + jitter,
-                            vals,
-                            color="black",
-                            s=22,
-                            alpha=0.50,
-                            zorder=4,
-                            linewidths=0,
-                        )
-                    elif len(vals) == 1:
-                        ax.scatter(
-                            gi + offset,
-                            vals,
-                            color="black",
-                            s=22,
-                            alpha=0.60,
-                            zorder=4,
-                            linewidths=0,
-                        )
-
-            # Reference line
-            if ref is not None:
-                ax.axhline(ref, color=_CLR["rej"], lw=1.3, ls="--", label=f"ref = {ref}", zorder=3)
-
-            if timepoints:
-                ax.legend(loc="upper right", fontsize=7.5, framealpha=0.85)
-
-            # n= labels per group (below x-axis)
-            for gi, g in enumerate(groups):
-                n_total = sum(len(data[(g, tp)]) for tp in tp_iter)
-                ax.text(
-                    gi,
-                    0,
-                    f"n={n_total}",
-                    ha="center",
-                    va="top",
-                    fontsize=6.5,
-                    color=_CLR["muted"],
-                    transform=ax.get_xaxis_transform(),
-                )
-
-            ymax = max(all_vals_flat) if all_vals_flat else 1.0
-            ax.set_ylim(bottom=0, top=ymax * 1.30)
-            ax.set_xticks(x_pos)
-            ax.set_xticklabels(groups, fontsize=8, rotation=30, ha="right")
-            ylabel = f"{title} ({unit_lbl})" if unit_lbl else title
-            ax.set(title=title, ylabel=ylabel)
-            ax.yaxis.set_major_locator(plt.MaxNLocator(5))
-
-        fig.savefig(
-            str(out_path),
-            dpi=150,
-            bbox_inches="tight",
-            facecolor=fig.get_facecolor(),
-        )
-        plt.close(fig)

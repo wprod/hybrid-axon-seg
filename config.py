@@ -32,6 +32,7 @@ AXON_MIN_MYELIN_FRAC = 0.30  # adaptive floor: axon must also be ≥ frac×outer
 # (larger fibers → thicker myelin → larger minimum gap)
 OUTER_ERODE_PX = 2  # erode fiber mask before morphometrics (shrinks fiber → less myelin)
 AXON_INPUT_WHITE_POINT = 255  # clip white point of axon_input (pixels above → 255); 255 = off
+GRATIO_MAP = False  # spatial g-ratio heatmap (slow — enable only if needed)
 
 # QC filters  (permissive by default — clinician adjusts)
 MIN_GRATIO = 0.3

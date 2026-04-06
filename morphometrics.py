@@ -149,14 +149,20 @@ def compute_aggregate(
     # ── AVF / MVF / G-ratio / density: QC-passed fibres only ───────────
     if len(df_pass) and nerve_um2:
         total_axon_um2 = df_pass["axon_area"].sum()
-        total_myelin_um2 = df_pass["fiber_area"].sum() - total_axon_um2
+        total_fiber_um2_pass = df_pass["fiber_area"].sum()
+        total_myelin_um2 = total_fiber_um2_pass - total_axon_um2
         avf = total_axon_um2 / nerve_um2
         mvf = total_myelin_um2 / nerve_um2
         gratio_aggr = float(df_pass["gratio"].mean())
+        gratio_area_weighted = (
+            float(np.sqrt(total_axon_um2 / total_fiber_um2_pass))
+            if total_fiber_um2_pass > 0
+            else 0.0
+        )
         axon_density = len(df_pass) / (nerve_um2 * 1e-6)
     else:
         total_axon_um2 = total_myelin_um2 = 0.0
-        avf = mvf = gratio_aggr = axon_density = 0.0
+        avf = mvf = gratio_aggr = gratio_area_weighted = axon_density = 0.0
 
     return {
         "group": group,
@@ -169,6 +175,7 @@ def compute_aggregate(
         "total_myelin_area_mm2": total_myelin_um2 * 1e-6,
         "nratio": nratio,
         "gratio_aggr": gratio_aggr,
+        "gratio_area_weighted": gratio_area_weighted,
         "avf": avf,
         "mvf": mvf,
         "axon_density_mm2": axon_density,

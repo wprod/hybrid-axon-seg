@@ -28,7 +28,6 @@ from preprocessing import build_axon_input
 from qc import apply_qc
 from utils import build_fascicle_mask, clean_stem, find_low_qc_cluster_labels, find_satellite_labels
 from visualization import (
-    make_comparison,
     make_dashboard,
     make_gratio_map,
     make_numbered,
@@ -36,6 +35,10 @@ from visualization import (
 )
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Bump this version whenever detection logic or relevant config defaults change.
+# When the stored version in *_axon_version.txt differs, axon caches are rebuilt.
+_AXON_CACHE_VERSION = "2"
 
 
 def _remove_labels(outer_labels: np.ndarray, labels_to_remove: set) -> np.ndarray:
@@ -148,8 +151,18 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
 
     # ── Step 2: Axon detection ────────────────────────────────────────────
     cache_axon = out_dir / f"{stem}_axon_inner.npy"
-
     cache_multicore = out_dir / f"{stem}_multicore_labels.npy"
+    version_file = out_dir / f"{stem}_axon_version.txt"
+
+    # Invalidate axon cache when detection logic has changed
+    if cache_axon.exists():
+        stored_ver = version_file.read_text().strip() if version_file.exists() else ""
+        if stored_ver != _AXON_CACHE_VERSION:
+            print("       axon detection version changed — clearing axon cache")
+            cache_axon.unlink()
+            for _stale in (out_dir / f"{stem}_axon_input.png", cache_multicore):
+                if _stale.exists():
+                    _stale.unlink()
 
     if cache_axon.exists():
         print("  [2/2] Axon detection — loading from cache…")
@@ -180,6 +193,7 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
             inner_labels_raw[r0 : r0 + crop.shape[0], c0 : c0 + crop.shape[1]][crop] = fiber_label
         np.save(str(cache_axon), inner_labels_raw)
         np.save(str(cache_multicore), np.array(sorted(multicore_labels), dtype=np.int32))
+        version_file.write_text(_AXON_CACHE_VERSION)
 
     # ── Step 2b: Hard myelin-gap enforcement ─────────────────────────────
     # Guarantee that no axon pixel is within the mandatory margin of its fiber
@@ -224,6 +238,7 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
             if crop.sum() >= config.MIN_AXON_SIZE:
                 axon_assignments[int(lbl)] = (minr, minc, crop)
         np.save(str(cache_axon), inner_labels_raw)
+        version_file.write_text(_AXON_CACHE_VERSION)
 
     # ── Step 3: Morphometrics + QC ────────────────────────────────────────
     print("  Computing morphometrics…")
@@ -281,7 +296,17 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     )
 
     # ── Step 4: Save data ─────────────────────────────────────────────────
-    pub_cols = [c for c in df_pass.columns if not c.startswith("_")]
+    _CLINICAL_COLS = [
+        "axon_diam",
+        "fiber_diam",
+        "gratio",
+        "myelin_thickness",
+        "axon_area",
+        "fiber_area",
+        "x0",
+        "y0",
+    ]
+    pub_cols = [c for c in _CLINICAL_COLS if c in df_pass.columns]
     df_pass[pub_cols].to_csv(out_dir / f"{stem}_morphometrics.csv", index=False)
     try:
         df_pass[pub_cols].to_excel(out_dir / f"{stem}_morphometrics.xlsx", index=False)
@@ -307,7 +332,8 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     )
     io.imsave(str(out_dir / f"{stem}_numbered.png"), numbered, check_contrast=False)
 
-    make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")
+    if getattr(config, "GRATIO_MAP", False):
+        make_gratio_map(img, df_pass, index_image, out_dir / f"{stem}_gratio_map.png")
     make_dashboard(
         df_pass,
         df_rej,
@@ -368,8 +394,14 @@ def main() -> None:
         stem = clean_stem(p)
         agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
         fascicle_path = config.OUTPUT_DIR / stem / f"{stem}_fascicle_mask_edited.npy"
-        # Skip only if aggregate is newer than the fascicle mask
-        if agg_path.exists() and agg_path.stat().st_mtime >= fascicle_path.stat().st_mtime:
+        # Skip only if aggregate is newer than the fascicle mask AND axon cache is current
+        ver_path = config.OUTPUT_DIR / stem / f"{stem}_axon_version.txt"
+        ver_ok = ver_path.exists() and ver_path.read_text().strip() == _AXON_CACHE_VERSION
+        if (
+            agg_path.exists()
+            and ver_ok
+            and agg_path.stat().st_mtime >= fascicle_path.stat().st_mtime
+        ):
             print(f"  ↷ {stem}  (already processed, skipping)")
             agg = pd.read_csv(agg_path).iloc[0].to_dict()
             results.append({"image": stem, **agg})
@@ -389,9 +421,7 @@ def main() -> None:
         print(summary.to_string(index=False))
         print(f"{'=' * 60}")
 
-        print("  Generating comparison figure…")
-        make_comparison(results, config.OUTPUT_DIR / "comparison.png")
-        print(f"  ✓ comparison.png → {config.OUTPUT_DIR}")
+        print("  ✓ Use compare.py for cross-sample comparison dashboard")
 
 
 if __name__ == "__main__":
