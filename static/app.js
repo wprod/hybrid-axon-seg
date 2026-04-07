@@ -65,6 +65,11 @@ class App {
     this._qLog     = [];    // [{id, label, state}] for action stack UI
     this._qLogSeq  = 0;     // unique id counter
 
+    // Multi-user presence
+    this._clientId = Math.random().toString(36).slice(2, 10);
+    this._presenceTimer = null;
+    this._presenceCounts = {};  // stem → viewer count
+
     // Touch-confirm for delete mode
     this._delConfirm = null;
 
@@ -91,9 +96,14 @@ class App {
     }
     await this.loadList();
     if (this.stems.length) {
-      this.select(this.stems[0]);
+      const hashStem = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
+      const initial = (hashStem && this.stems.includes(hashStem)) ? hashStem : this.stems[0];
+      this.select(initial);
       $('#hint').classList.add('hidden');
     }
+    // Poll all-presence every 10s to update sidebar badges
+    setInterval(() => this._pollPresence(), 10000);
+    window.addEventListener('pagehide', () => this._stopPresence());
     // Resume polling if batch was already running
     try {
       const r = await fetch('/api/recompute-all/status');
@@ -240,7 +250,9 @@ class App {
 
   async select(stem) {
     this.cur = stem;
+    history.replaceState(null, '', '#' + encodeURIComponent(stem));
     $('#current-stem').textContent = stem;
+    this._startPresence(stem);
     $$('#img-list li').forEach(li => li.classList.toggle('active', li.dataset.stem === stem));
 
     this.img = null;
@@ -1350,6 +1362,7 @@ class App {
       lbl.textContent = `⚙ ${pending}`;
       lbl.style.color = 'var(--amber)';
       lbl.classList.remove('hidden');
+      $('#btn-recompute').disabled = true;
     }
   }
 
@@ -1368,6 +1381,45 @@ class App {
       lbl.textContent = '✓';
       lbl.style.color = 'var(--green)';
       setTimeout(() => lbl.classList.add('hidden'), 700);
+    }
+    $('#btn-recompute').disabled = false;
+  }
+
+  _startPresence(stem) {
+    clearInterval(this._presenceTimer);
+    const ping = () => fetch(`/api/presence/${stem}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this._clientId }),
+    }).then(r => r.json()).then(d => {
+      this._presenceCounts[stem] = d.viewers;
+      this._updatePresenceBadge(stem, d.viewers);
+    }).catch(() => {});
+    ping();
+    this._presenceTimer = setInterval(ping, 5000);
+  }
+
+  _stopPresence() {
+    clearInterval(this._presenceTimer);
+  }
+
+  async _pollPresence() {
+    try {
+      const counts = await fetch('/api/presence').then(r => r.json());
+      this._presenceCounts = counts;
+      for (const [stem, n] of Object.entries(counts)) this._updatePresenceBadge(stem, n);
+    } catch {}
+  }
+
+  _updatePresenceBadge(stem, n) {
+    const li = document.querySelector(`#img-list li[data-stem="${CSS.escape(stem)}"]`);
+    if (!li) return;
+    let badge = li.querySelector('.presence-badge');
+    if (n > 1) {
+      if (!badge) { badge = document.createElement('span'); badge.className = 'presence-badge'; li.insertBefore(badge, li.querySelector('.img-n')); }
+      badge.textContent = `👥 ${n}`;
+      badge.title = `${n} people viewing this image`;
+    } else if (badge) {
+      badge.remove();
     }
   }
 

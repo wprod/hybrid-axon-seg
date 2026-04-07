@@ -11,6 +11,7 @@ import os
 import secrets
 import shutil
 import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,11 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 # same image so concurrent requests can't corrupt .npy files.
 
 _stem_locks: dict[str, threading.Lock] = {}
+
+# ── In-memory presence tracking ─────────────────────────────────────────────
+# stem → {client_id: last_seen_unix_ts}  (ephemeral, lost on server restart)
+_presence: dict[str, dict[str, float]] = {}
+_PRESENCE_TTL = 12.0  # seconds before a client is considered gone
 
 
 def _lock(stem: str) -> threading.Lock:
@@ -1168,6 +1174,32 @@ def recompute_all_status():
 def get_config():
     """Expose selected config flags to the frontend."""
     return {"gratio_map": getattr(config, "GRATIO_MAP", False)}
+
+
+class PresenceReq(BaseModel):
+    client_id: str
+
+
+@app.post("/api/presence/{stem}")
+def presence_ping(stem: str, body: PresenceReq):
+    """Heartbeat — client announces it is viewing this stem."""
+    now = time.time()
+    stem_map = _presence.setdefault(stem, {})
+    stem_map[body.client_id] = now
+    # Prune stale clients
+    _presence[stem] = {k: v for k, v in stem_map.items() if now - v < _PRESENCE_TTL}
+    return {"viewers": len(_presence[stem])}
+
+
+@app.get("/api/presence")
+def presence_all():
+    """Return active viewer counts for every stem that has at least one viewer."""
+    now = time.time()
+    return {
+        stem: len([v for v in clients.values() if now - v < _PRESENCE_TTL])
+        for stem, clients in _presence.items()
+        if any(now - v < _PRESENCE_TTL for v in clients.values())
+    }
 
 
 @app.get("/api/comparison")

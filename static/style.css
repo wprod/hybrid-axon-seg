@@ -74,6 +74,7 @@ main{flex:1;display:flex;overflow:hidden}
 .img-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .img-n{font-size:10px;color:var(--muted)}
 .reseg-badge{font-size:10px;color:var(--amber);flex-shrink:0;line-height:1}
+.presence-badge{font-size:10px;color:var(--accent);flex-shrink:0;line-height:1}
 
 /* ── Viewer ────────────────────────────────────────────────────────────── */
 #viewer{flex:1;position:relative;overflow:hidden;background:#0a0c0f}
