@@ -92,6 +92,7 @@ def finalize_image(
     has_fascicle: bool = False,
     fascicle_mask: np.ndarray | None = None,
     excl_mask: np.ndarray | None = None,
+    qc_overrides: set[int] | None = None,
 ) -> tuple[str, int, dict]:
     """Shared pipeline tail: morphometrics → QC → aggregate → CSV → visualizations.
 
@@ -109,7 +110,15 @@ def finalize_image(
     print(f"       → {len(df_all)} axons measured")
 
     df_pass, df_rej = apply_qc(df_all)
-    print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject")
+    # Re-admit manually accepted fibers
+    if qc_overrides:
+        override_mask = df_rej["_fiber_label"].isin(qc_overrides)
+        if override_mask.any():
+            df_pass = pd.concat([df_pass, df_rej[override_mask]], ignore_index=True)
+            df_rej = df_rej[~override_mask].copy()
+    n_overridden = sum(1 for lbl in (qc_overrides or []) if lbl in df_all["_fiber_label"].values)
+    override_note = f" ({n_overridden} manually accepted)" if n_overridden else ""
+    print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject{override_note}")
 
     # Remove low-QC clusters — skipped when fascicle mask constrains Cellpose
     if not has_fascicle:

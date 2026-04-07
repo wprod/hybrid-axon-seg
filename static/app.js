@@ -57,11 +57,13 @@ class App {
     this.overlayOpacity = 0.85;
 
     // Operation queue — batches rapid edits into a single overlay refresh
-    this._qItems   = [];    // pending async functions
+    this._qItems   = [];    // pending {fn, id} objects
     this._qRunning = false;
     this._qDirty   = false; // overlay needs refresh after drain
     this._qTotal   = 0;     // ops added in current batch
     this._qDone    = 0;     // ops completed in current batch
+    this._qLog     = [];    // [{id, label, state}] for action stack UI
+    this._qLogSeq  = 0;     // unique id counter
 
     // Touch-confirm for delete mode
     this._delConfirm = null;
@@ -183,15 +185,28 @@ class App {
     }
     this.mode = m;
     $$('.mode-btn').forEach(b => b.classList.toggle('active', b.dataset.mode === m));
-    $('#viewer').className = `mode-${m}`;
+    $('#viewer').className = `mode-${m}${this.spaceHeld ? ' space-held' : ''}`;
+
+    // Cursor hint label
+    const hintEl = document.getElementById('cursor-hint');
+    if (hintEl) {
+      const hintLabels = {
+        delete: 'Delete', fiber: '+Fiber', fascicle: 'Fascicle',
+        'paint-axon': '+Axon', 'paint-outer': '+Myelin', 'erase-outer': 'Erase',
+        exclude: 'Exclude', accept: 'Accept QC',
+      };
+      const lbl = hintLabels[m];
+      if (lbl) { hintEl.className = `m-${m}`; hintEl.textContent = lbl; }
+      else      { hintEl.className = 'hidden'; }
+    }
 
     const toasts = {
-      'fiber': 'Step 1/2 — draw outer boundary (myelin/violet)',
+      'fiber': 'Step 1/2 — draw outer boundary (myelin)',
       'fascicle': 'Click to place points — close on 1st point or double-click',
-      'exclude': 'Click to place points — zone excluded from N-ratio/AVF/MVF (total nerve area kept)',
-      'paint-axon': 'Drag lasso — fills green (axon) inside',
-      'paint-outer': 'Drag lasso — fills violet (new outer fiber)',
-      'erase-outer': 'Drag lasso — erases violet and green inside the zone',
+      'exclude': 'Click to place points — excluded from N-ratio/AVF/MVF denominator',
+      'paint-axon': 'Drag lasso → fills axon',
+      'paint-outer': 'Drag lasso → fills myelin sheath',
+      'erase-outer': 'Drag lasso → erases myelin + axon',
     };
     if (toasts[m]) this.toast(toasts[m], 'info');
     this.render();
@@ -480,15 +495,23 @@ class App {
     const r = 14 / this.zoom, lw = 1.5 / this.zoom;
     for (const a of this.anns) {
       ctx.save();
-      // Pending (queued but not yet confirmed by server) — small pulsing dot
+      // Pending — full-size dashed marker (amber) so user knows what's queued
       if (a.t === 'del_pending') {
-        ctx.fillStyle = 'rgba(239,83,80,0.55)';
-        ctx.beginPath(); ctx.arc(a.x, a.y, 5 / this.zoom, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,167,38,0.9)'; ctx.lineWidth = lw;
+        ctx.setLineDash([4 / this.zoom, 3 / this.zoom]);
+        ctx.beginPath(); ctx.arc(a.x, a.y, r, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(a.x - r * .55, a.y - r * .55); ctx.lineTo(a.x + r * .55, a.y + r * .55);
+        ctx.moveTo(a.x + r * .55, a.y - r * .55); ctx.lineTo(a.x - r * .55, a.y + r * .55);
+        ctx.stroke();
+        ctx.setLineDash([]);
         ctx.restore(); continue;
       }
       if (a.t === 'add_pending') {
-        ctx.fillStyle = 'rgba(102,187,106,0.55)';
-        ctx.beginPath(); ctx.arc(a.x, a.y, 5 / this.zoom, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = 'rgba(255,167,38,0.9)'; ctx.lineWidth = lw;
+        ctx.setLineDash([4 / this.zoom, 3 / this.zoom]);
+        ctx.beginPath(); ctx.arc(a.x, a.y, r, 0, Math.PI * 2); ctx.stroke();
+        ctx.setLineDash([]);
         ctx.restore(); continue;
       }
       if (a.t === 'del') {
@@ -719,6 +742,8 @@ class App {
       }
     }
 
+    if (this.mode === 'accept') { this.clickAccept(e); return; }
+
     // Freehand lasso modes
     if (['fiber', 'paint-axon', 'paint-outer', 'erase-outer'].includes(this.mode)) {
       this.drawing = true;
@@ -774,6 +799,7 @@ class App {
 
     const pt = this.s2i(e);
     $('#coords').textContent = `x=${pt.x}  y=${pt.y}`;
+    this._moveCursorHint(e.clientX, e.clientY);
 
     if (this.dragging) {
       this.panX += e.clientX - this.lastM.x;
@@ -894,7 +920,20 @@ class App {
   }
 
   onKey(e, down) {
-    if (e.code === 'Space') { this.spaceHeld = down; if (down) e.preventDefault(); return; }
+    if (e.code === 'Space') {
+      this.spaceHeld = down;
+      if (down) {
+        e.preventDefault();
+        if (this.drawing) { this.drawing = false; this.drawPts = []; this.render(); }
+        $('#viewer').classList.add('space-held');
+        const h = document.getElementById('cursor-hint'); if (h) h.style.display = 'none';
+      } else {
+        $('#viewer').classList.remove('space-held');
+        const h = document.getElementById('cursor-hint');
+        if (h && !h.classList.contains('hidden')) h.style.display = '';
+      }
+      return;
+    }
     if (!down) return;
     if ((e.ctrlKey || e.metaKey) && e.key === 'z') { e.preventDefault(); this.undo(); return; }
     if (e.key.length === 1) {
@@ -903,12 +942,13 @@ class App {
     }
     if (e.key === '1') this.setMode('navigate');
     if (e.key === '2') this.setMode('delete');
-    if (e.key === '3') this.setMode('fiber');
-    if (e.key === '4') this.setMode('fascicle');
-    if (e.key === '5') this.setMode('paint-axon');
-    if (e.key === '6') this.setMode('paint-outer');
-    if (e.key === '7') this.setMode('erase-outer');
+    if (e.key === '3') this.setMode('paint-axon');
+    if (e.key === '4') this.setMode('paint-outer');
+    if (e.key === '5') this.setMode('erase-outer');
+    if (e.key === '6') this.setMode('fiber');
+    if (e.key === '7') this.setMode('fascicle');
     if (e.key === '8') this.setMode('exclude');
+    if (e.key === '9') this.setMode('accept');
     if (e.key === 'Escape') {
       if (this.mode === 'fiber' && (this.drawing || this.fiberStep > 0)) {
         this.fiberStep = 0; this.outerPoly = []; this.drawPts = [];
@@ -977,7 +1017,26 @@ class App {
       this.anns.push({ t: 'del', x: d.x, y: d.y, label: d.deleted });
       this.editCount++; this.showEditCount();
       this._qDirty = true; this.render();
-    });
+    }, 'Delete');
+  }
+
+  async clickAccept(e) {
+    if (!this.cur) return;
+    const pt = this.s2i(e);
+    try {
+      const r = await fetch(`/api/image/${this.cur}/qc-accept`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ x: pt.x, y: pt.y }),
+      });
+      if (!r.ok) { this.toast((await r.json()).detail || 'No fiber here', 'err'); return; }
+      const d = await r.json();
+      const msg = d.status === 'added'
+        ? `Fiber #${d.label} accepted — Recompute to apply`
+        : `Fiber #${d.label} un-accepted`;
+      this.toast(msg, 'info');
+      // Mark panel stale so "Recompute to refresh" banner shows
+      document.getElementById('panel')?.classList.add('stale');
+    } catch (err) { this.toast(err.message, 'err'); }
   }
 
   async submitFiber(innerPts) {
@@ -1021,7 +1080,7 @@ class App {
       this.anns.push({ t: 'add', x: d.x, y: d.y });
       this.editCount++; this.showEditCount();
       this._qDirty = true; this.render();
-    });
+    }, '+Axon');
   }
 
   async submitPaintOuter(pts) {
@@ -1044,7 +1103,7 @@ class App {
       this.anns.push({ t: 'fiber', x: d.x, y: d.y });
       this.editCount++; this.showEditCount();
       this._qDirty = true; this.render();
-    });
+    }, '+Myelin');
   }
 
   async submitEraseOuter(pts) {
@@ -1065,7 +1124,7 @@ class App {
       if (!resp.ok) { this.toast((await resp.json()).detail || 'Error', 'err'); this.render(); return; }
       this.editCount++; this.showEditCount();
       this._qDirty = true; this.render();
-    });
+    }, 'Erase');
   }
 
   async submitFascicle(pts) {
@@ -1145,6 +1204,8 @@ class App {
     if (this._qItems.length > 0) {
       this._qItems = [];
       this._qDirty = false;
+      this._qLog = [];
+      this._renderStack();
       this._qBarDone();
     }
     try {
@@ -1204,16 +1265,20 @@ class App {
 
   /* ── Operation queue ─────────────────────────────────────────────────── */
 
-  /** Push an async operation; start draining if idle. */
-  _enqueue(fn) {
+  /** Push an async operation with an optional display label. */
+  _enqueue(fn, label = 'Op') {
     if (!this._qRunning && this._qItems.length === 0) {
       // Fresh batch — reset counters
       this._qTotal = 0;
       this._qDone  = 0;
     }
-    this._qItems.push(fn);
+    const id = ++this._qLogSeq;
+    this._qLog.push({ id, label, state: 'pending' });
+    if (this._qLog.length > 10) this._qLog.shift();
+    this._qItems.push({ fn, id });
     this._qTotal++;
     this._qBar();
+    this._renderStack();
     if (!this._qRunning) this._drain();
   }
 
@@ -1222,19 +1287,55 @@ class App {
     this._qRunning = true;
     this._qBar();
     while (this._qItems.length > 0) {
-      const fn = this._qItems.shift();
-      try { await fn(); } catch {}  // errors handled inside fn
+      const { fn, id } = this._qItems.shift();
+      const entry = this._qLog.find(e => e.id === id);
+      if (entry) { entry.state = 'active'; this._renderStack(); }
+      try {
+        await fn();
+        if (entry) entry.state = 'done';
+      } catch {
+        if (entry) entry.state = 'err';
+      }
       this._qDone++;
+      this._renderStack();
       this._qBar();
     }
     this._qRunning = false;
     this._qBarDone();
+    setTimeout(() => { this._qLog = []; this._renderStack(); }, 1800);
     if (this._qDirty && this.cur) {
       this._qDirty = false;
       // Regenerate overlay PNG server-side (deferred refresh), then fetch it
       try { await fetch(`/api/image/${this.cur}/rebuild-overlay`, { method: 'POST' }); } catch {}
       this.reloadOverlay();
     }
+  }
+
+  _renderStack() {
+    let el = document.getElementById('action-stack');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'action-stack';
+      document.getElementById('viewer')?.appendChild(el);
+    }
+    if (this._qLog.length === 0) { el.innerHTML = ''; return; }
+    const pending = this._qLog.filter(e => e.state === 'pending').length;
+    const header = pending > 0
+      ? `<div class="aq-header">⚙ ${pending} pending</div>`
+      : '';
+    el.innerHTML = header + this._qLog.map(({ label, state }) => {
+      const icon = state === 'active' ? '▶' : state === 'done' ? '✓' : state === 'err' ? '✕' : '·';
+      return `<div class="aq-item ${state}">${icon} ${label}</div>`;
+    }).join('');
+  }
+
+  _moveCursorHint(cx, cy) {
+    const el = document.getElementById('cursor-hint');
+    if (!el || el.classList.contains('hidden') || this.spaceHeld || this.dragging) return;
+    const rc = document.getElementById('viewer').getBoundingClientRect();
+    el.style.display = '';
+    el.style.left = (cx - rc.left + 16) + 'px';
+    el.style.top  = (cy - rc.top  + 16) + 'px';
   }
 
   _qBar() {

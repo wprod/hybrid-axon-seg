@@ -199,6 +199,19 @@ def _clear_undo(stem: str) -> None:
             snap.unlink()
 
 
+def _load_qc_overrides(stem: str) -> set[int]:
+    p = _out(stem) / f"{stem}_qc_overrides.json"
+    if not p.exists():
+        return set()
+    return set(json.load(open(p)))
+
+
+def _save_qc_overrides(stem: str, overrides: set[int]) -> None:
+    p = _out(stem) / f"{stem}_qc_overrides.json"
+    with open(p, "w") as f:
+        json.dump(sorted(overrides), f)
+
+
 def _load_fascicle_mask(stem: str, outer: np.ndarray) -> np.ndarray:
     """Load fascicle mask — user-edited version if it exists, else auto-computed."""
     edited = _out(stem) / f"{stem}_fascicle_mask_edited.npy"
@@ -471,11 +484,14 @@ def get_info(stem: str):
 
 
 def _safe(v):
-    """Make numpy scalars JSON-serialisable."""
+    """Make numpy scalars JSON-serialisable (nan/inf → None)."""
     if isinstance(v, (np.integer,)):
         return int(v)
-    if isinstance(v, (np.floating,)):
-        return float(v)
+    if isinstance(v, (np.floating, float)):
+        f = float(v)
+        if np.isnan(f) or np.isinf(f):
+            return None
+        return f
     return v
 
 
@@ -974,6 +990,7 @@ def recompute(stem: str):
             has_fascicle=has_fascicle,
             fascicle_mask=fascicle_mask,
             excl_mask=excl_mask,
+            qc_overrides=_load_qc_overrides(stem),
         )
 
         _save_edits(stem, {"deleted": [], "added": []})
@@ -1011,10 +1028,33 @@ def reset_image(stem: str):
             fascicle_edited.unlink()
         if excl_path.exists():
             excl_path.unlink()
+        overrides_path = d / f"{stem}_qc_overrides.json"
+        if overrides_path.exists():
+            overrides_path.unlink()
 
         _save_edits(stem, {"deleted": [], "added": []})
         _clear_undo(stem)
         return {"status": "ok"}
+
+
+@app.post("/api/image/{stem}/qc-accept")
+def qc_accept(stem: str, pt: PointReq):
+    """Toggle QC override for the fiber at (x, y). Requires Recompute to apply."""
+    with _lock(stem):
+        outer = _load_outer(stem)
+        if pt.y >= outer.shape[0] or pt.x >= outer.shape[1]:
+            raise HTTPException(400, "Point out of bounds")
+        label = int(outer[pt.y, pt.x])
+        if label == 0:
+            raise HTTPException(404, "No fiber at this point")
+        overrides = _load_qc_overrides(stem)
+        if label in overrides:
+            overrides.discard(label)
+            _save_qc_overrides(stem, overrides)
+            return {"status": "removed", "label": label}
+        overrides.add(label)
+        _save_qc_overrides(stem, overrides)
+        return {"status": "added", "label": label}
 
 
 @app.post("/api/image/{stem}/undo")
@@ -1079,6 +1119,7 @@ def _batch_recompute_worker(stems: list[str]):
                     has_fascicle=has_fascicle,
                     fascicle_mask=fascicle_mask,
                     excl_mask=excl_mask,
+                    qc_overrides=_load_qc_overrides(stem),
                 )
                 _save_edits(stem, {"deleted": [], "added": []})
                 _clear_undo(stem)

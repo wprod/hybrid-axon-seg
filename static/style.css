@@ -33,6 +33,7 @@ header{background:var(--bg3);border-bottom:1px solid var(--brd);
 [data-mode="erase-outer"].active{background:var(--red);color:#fff;border-color:var(--red)}
 [data-mode="fascicle"].active{background:#F1C40F;color:#000;border-color:#F1C40F}
 [data-mode="exclude"].active{background:#E67E22;color:#fff;border-color:#E67E22}
+[data-mode="accept"].active{background:#00bcd4;color:#000;border-color:#00bcd4}
 .sep-sm{width:1px;height:16px;background:var(--brd);margin:0 1px}
 
 /* Action buttons */
@@ -97,7 +98,22 @@ main{flex:1;display:flex;overflow:hidden}
 #viewer.mode-erase-outer #canvas{cursor:crosshair}
 #viewer.mode-exclude #canvas{cursor:crosshair}
 #viewer.mode-navigate #canvas{cursor:grab}
-#viewer.panning #canvas{cursor:grabbing}
+#viewer.space-held #canvas{cursor:grab!important}
+#viewer.panning #canvas{cursor:grabbing!important}
+
+/* ── Cursor mode hint ─────────────────────────────────────────────────────── */
+#cursor-hint{position:absolute;pointer-events:none;z-index:7;
+  font-size:11px;font-weight:700;padding:2px 7px;border-radius:3px;
+  background:rgba(0,0,0,.72);white-space:nowrap;border-left:3px solid var(--accent);
+  color:var(--accent);transition:border-color .1s,color .1s}
+#cursor-hint.m-delete      {border-color:var(--accent);color:var(--accent)}
+#cursor-hint.m-fiber       {border-color:var(--accent);color:var(--accent)}
+#cursor-hint.m-paint-axon  {border-color:var(--green);color:var(--green)}
+#cursor-hint.m-paint-outer {border-color:#9b59b6;color:#b57bee}
+#cursor-hint.m-erase-outer {border-color:var(--red);color:var(--red)}
+#cursor-hint.m-fascicle    {border-color:#F1C40F;color:#F1C40F}
+#cursor-hint.m-exclude     {border-color:#E67E22;color:#E67E22}
+#cursor-hint.m-accept      {border-color:#00bcd4;color:#00bcd4}
 
 /* ── Right panel ───────────────────────────────────────────────────────── */
 #panel{width:240px;min-width:200px;background:var(--bg2);border-left:1px solid var(--brd);
@@ -145,6 +161,20 @@ main{flex:1;display:flex;overflow:hidden}
 #stale-banner{display:none;text-align:center;font-size:10px;color:var(--amber);
   padding:4px;border:1px dashed var(--amber);border-radius:4px;margin-top:6px}
 #panel.stale #stale-banner{display:block}
+
+/* ── Action stack ────────────────────────────────────────────────────────── */
+#action-stack{position:absolute;bottom:28px;right:12px;z-index:5;pointer-events:none;
+  display:flex;flex-direction:column;gap:1px;
+  background:rgba(0,0,0,.55);border-radius:5px;padding:4px;min-width:110px}
+#action-stack:empty{padding:0}
+.aq-header{font-size:11px;font-weight:700;color:var(--amber);padding:1px 6px 3px;
+  border-bottom:1px solid rgba(255,255,255,.1);margin-bottom:2px}
+.aq-item{display:flex;align-items:center;gap:6px;font-size:11px;font-variant-numeric:tabular-nums;
+  padding:2px 6px;border-radius:2px;white-space:nowrap;transition:opacity .15s}
+.aq-item.pending{color:var(--txt);opacity:.8}
+.aq-item.active{color:var(--amber);opacity:1;font-weight:700;background:rgba(255,167,38,.12)}
+.aq-item.done{color:var(--green);opacity:.5}
+.aq-item.err{color:var(--red);opacity:.85}
 
 /* ── Touch / tablet ───────────────────────────────────────────────────────── */
 @media (pointer: coarse) {

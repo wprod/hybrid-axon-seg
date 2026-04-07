@@ -17,13 +17,15 @@
     <div class="toolbar">
       <button class="mode-btn active" data-mode="navigate" title="1 — Pan / zoom">1 Nav</button>
       <button class="mode-btn" data-mode="delete" title="2 — Click a fiber to delete it">2 Delete</button>
-      <button class="mode-btn" data-mode="fiber" title="3 — Add a complete fiber (step 1: draw outer/myelin, step 2: draw axon inside)">3 +Fiber</button>
-      <button class="mode-btn" data-mode="fascicle" title="4 — Draw fascicle boundary polygon">4 Fasc</button>
       <span class="sep-sm"></span>
-      <button class="mode-btn" data-mode="paint-axon" title="5 — Lasso: paint green (axon) inside an existing fiber">5 +Green</button>
-      <button class="mode-btn" data-mode="paint-outer" title="6 — Lasso: paint violet (new outer fiber, no axon)">6 +Violet</button>
-      <button class="mode-btn" data-mode="erase-outer" title="7 — Lasso: erase violet and green inside the zone">7 Erase</button>
-      <button class="mode-btn" data-mode="exclude" title="8 — Draw a zone excluded from N-ratio/AVF/MVF denominator (total nerve area is kept in the data)">8 Excl</button>
+      <button class="mode-btn" data-mode="paint-axon" title="3 — Lasso: paint axon inside an existing fiber">3 +Axon</button>
+      <button class="mode-btn" data-mode="paint-outer" title="4 — Lasso: paint myelin sheath (new outer contour, no axon)">4 +Myelin</button>
+      <button class="mode-btn" data-mode="erase-outer" title="5 — Lasso: erase myelin and axon inside the zone">5 Erase</button>
+      <span class="sep-sm"></span>
+      <button class="mode-btn" data-mode="fiber" title="6 — Add a complete new fiber (draw outer, then axon inside)">6 +Fiber</button>
+      <button class="mode-btn" data-mode="fascicle" title="7 — Draw fascicle boundary polygon">7 Fascicle</button>
+      <button class="mode-btn" data-mode="exclude" title="8 — Draw exclusion zone (removed from N-ratio / AVF / MVF denominator)">8 Exclude</button>
+      <button class="mode-btn" data-mode="accept" title="9 — Click a QC-rejected fiber to accept it (toggle) — Recompute to apply">9 Accept</button>
     </div>
     <span class="sep"></span>
     <div class="toolbar">
@@ -59,6 +61,7 @@
 
     <section id="viewer">
       <canvas id="canvas"></canvas>
+      <div id="cursor-hint" class="hidden"></div>
       <div id="op-bar"><div id="op-bar-fill"></div></div>
       <div id="hint" class="hint">No images found. Run the pipeline first.</div>
       <div id="loading" class="loading hidden">Loading...</div>
@@ -91,24 +94,24 @@
 
       <div id="shortcuts" class="mt">
         <h3>Shortcuts</h3>
-        <div class="sc">1/2/3/4 — nav / delete / +fiber / fasc</div>
-        <div class="sc">5/6/7/8 — +green / +violet / erase / excl</div>
+        <div class="sc">1 Nav · 2 Delete · 3 +Axon · 4 +Myelin · 5 Erase</div>
+        <div class="sc">6 +Fiber · 7 Fascicle · 8 Exclude · 9 Accept</div>
         <div class="sc">Left/Right — prev/next</div>
         <div class="sc">F — fit to view</div>
         <div class="sc">Scroll — zoom</div>
         <div class="sc">Right-drag / Space+drag — pan</div>
         <div class="sc">Ctrl/Cmd+Z — undo last edit</div>
         <div class="sc">Esc — cancel draw</div>
-        <div class="sc" style="margin-top:6px;color:#66bb6a">5 +Green: drag lasso → fills axon (green)</div>
-        <div class="sc" style="color:#9b59b6">6 +Violet: drag lasso → fills outer fiber (violet)</div>
-        <div class="sc" style="color:#ef5350">7 Erase: drag lasso → erases violet + green</div>
-        <div class="sc" style="color:#E67E22">8 Excl: polygon → excluded from N-ratio denom.</div>
-        <div class="sc" style="color:#F1C40F">4 Fasc: click pts, close = 1st pt</div>
+        <div class="sc" style="margin-top:6px;color:#66bb6a">3 +Axon: lasso → fills axon</div>
+        <div class="sc" style="color:#9b59b6">4 +Myelin: lasso → fills myelin sheath</div>
+        <div class="sc" style="color:#ef5350">5 Erase: lasso → erases myelin + axon</div>
+        <div class="sc" style="color:#F1C40F">7 Fascicle: click pts, close = 1st pt</div>
+        <div class="sc" style="color:#E67E22">8 Exclude: polygon → out of N-ratio denom.</div>
       </div>
     </aside>
   </main>
 
   <div id="toasts"></div>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=12"></script>
 </body>
 </html>
