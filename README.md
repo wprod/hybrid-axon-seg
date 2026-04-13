@@ -57,6 +57,8 @@ Key design decisions:
 | **Hull-constrained closing** | Axon blob gap-filling uses closing intersected with the convex hull — fills C-shapes without pushing the blob toward the myelin edge |
 | **Dual outer-labels (edited + gt)** | Clinician corrections are split: `_outer_edited.npy` tracks corrected predictions, `_outer_gt.npy` is the complete ground truth (includes additions). The diff reveals model false-negatives for fine-tuning |
 | **Two-level cache** | Cellpose results and axon detections are cached separately so detection parameters can be tuned without re-running Cellpose |
+| **QC overrides** | Clinician can manually accept QC-rejected fibers (mode 9) — stored in `*_qc_overrides.json`, applied on recompute |
+| **Per-stem write lock** | Concurrent edits to the same image are serialized via threading locks, so multi-user sessions can't corrupt `.npy` files |
 
 > **Image preparation:** contrast and brightness must be adjusted manually
 > (with a medical eye) in ImageJ/Fiji before running the pipeline, as optimal
@@ -74,7 +76,7 @@ Key design decisions:
    python app.py  →  http://127.0.0.1:8000
 
 3. For each image, draw the fascicle boundary
-   Select image → mode 4 (Fascicle) → click polygon points → close near first point
+   Select image → mode 7 (Fascicle) → click polygon points → close near first point
    (or double-click to close)
 
 4. Run segment.py once all fascicle masks are drawn
@@ -82,10 +84,12 @@ Key design decisions:
 
 5. Review results in the web app (works on desktop + iPad with Apple Pencil)
    - Delete false-positive axons (mode 2)
-   - Add missing fibers (mode 3) — saved to ground truth only for fine-tuning
+   - Add missing fibers (mode 6) — saved to ground truth only for fine-tuning
    - Draw exclusion zones (mode 8) — artefacts/tears subtracted from nerve area
+   - Accept QC-rejected fibers you disagree with (mode 9)
    - Click "Recompute" to apply edits to a single image
    - Images with pending edits show a ⚠ badge in the sidebar
+   - Undo last edit with Ctrl+Z / Cmd+Z
 
 6. Export: output/summary.csv + per-image CSVs in output/<stem>/
 ```
@@ -126,17 +130,30 @@ APP_PASSWORD=mypassword python app.py
 | Browse all images | Sidebar — shows axon count, edit status, ⚠ if recompute pending |
 | Blend overlay with raw image | Opacity slider in the header |
 | View overlay / numbered / dashboard / g-ratio map | Buttons per image |
-| Draw fascicle boundary | Mode 4 — click polygon points, close near first point or double-click |
-| Clear fascicle | "Clear fascicle" in right panel |
+| Navigate (pan / zoom) | Mode 1 |
 | Delete a false-positive fiber | Mode 2 — click on it |
-| Add a complete fiber (outer + axon) | Mode 3 — two-step lasso (saved to GT only) |
-| Paint axon inside existing fiber | Mode 5 — freehand lasso |
-| Paint new outer (myelin only) | Mode 6 — freehand lasso (saved to GT only) |
-| Erase region | Mode 7 — freehand lasso |
+| Paint axon inside existing fiber | Mode 3 — freehand lasso |
+| Paint new outer (myelin only) | Mode 4 — freehand lasso (saved to GT only) |
+| Erase region | Mode 5 — freehand lasso |
+| Add a complete fiber (outer + axon) | Mode 6 — two-step lasso (saved to GT only) |
+| Draw fascicle boundary | Mode 7 — click polygon points, close near first point or double-click |
 | Mark exclusion zone | Mode 8 — polygon (subtracted from nerve area) |
+| Accept QC-rejected fiber | Mode 9 — click to toggle; recompute to apply |
+| Clear fascicle | "Clear fascicle" in right panel |
+| Undo last edit | "Undo" button or Ctrl+Z / Cmd+Z |
 | Recompute morphometrics | "Recompute" button (single image) |
 | Recompute all images | "Recompute All" button (background — app stays usable) |
 | Open multi-image comparison | "Compare" button |
+
+**Multi-user awareness:**
+
+When multiple people are connected (e.g. via a Cloudflare tunnel), the sidebar
+shows presence badges indicating how many others are currently viewing each image.
+
+**URL hash routing:**
+
+Selecting an image updates the browser URL to `#stem_name`. Bookmarks and
+shared links jump directly to the right image.
 
 **iPad / Apple Pencil support:**
 
@@ -151,7 +168,7 @@ The app uses Pointer Events for unified mouse/touch/stylus input:
 | Mouse right-click / middle-click / space+drag | Pan |
 | Mouse wheel | Zoom |
 
-Keyboard shortcuts (1–8, Esc, arrows, F) work with an external keyboard.
+Keyboard shortcuts (1–9, Esc, arrows, F) work with an external keyboard.
 
 **Dual label maps for fine-tuning:**
 
@@ -163,7 +180,8 @@ Keyboard shortcuts (1–8, Esc, arrows, F) work with an external keyboard.
 Deletions and modifications update both files. Manual additions (new fibers the model missed) go only to `_outer_gt.npy`. This lets you compute false-negatives (`gt − edited`) and false-positives (deleted labels) for fine-tuning Cellpose.
 
 All edits are saved to `*_edits.json` and original `.npy` files are kept as
-`*_original.npy` backups. A "Reset" button restores any image to its pre-edit state.
+`*_original.npy` backups. QC overrides (mode 9) are stored in
+`*_qc_overrides.json`. A "Reset" button restores any image to its pre-edit state.
 
 ### Remote Access (Cloudflare Tunnel)
 
@@ -324,6 +342,7 @@ bounding-box crops for efficiency.
 - **N-ratio** counts ALL detected fibers (pass + rejected + no-axon) because
   every fibre occupies nerve cross-section regardless of health.
 - **AVF / MVF / G-ratio / density** use QC-passed fibers only (functional population).
+- **Area-weighted g-ratio** $\sqrt{\sum A_\text{axon} / \sum A_\text{fiber}}$ is reported alongside the arithmetic mean.
 - **Exclusion zones** (artefacts, tears drawn in the web UI) are subtracted
   from the fascicle area denominator so they don't dilute the ratios.
 - The fascicle area (manual or auto-computed) is the base denominator.
@@ -354,8 +373,8 @@ All thresholds are intentionally permissive — adjust in `config.py`.
 
 - **`*_overlay.png`** — Full-resolution color-coded overlay (green axon, blue myelin, rejection colors, white fascicle boundary)
 - **`*_numbered.png`** — Overlay with sequential numbers on QC-passed axons + stats banner
-- **`*_gratio_map.png`** — Per-axon g-ratio heatmap (RdYlGn colormap)
-- **`*_dashboard.png`** — Distributions, scatter plots, aggregate metrics table
+- **`*_gratio_map.png`** — Per-axon g-ratio heatmap (RdYlGn colormap) — only generated when `GRATIO_MAP = True`
+- **`*_dashboard.png`** — 2×4 layout: histograms (axon diam, fiber diam, g-ratio, myelin thickness), scatter plots, rejection breakdown, and aggregate metrics table
 
 ---
 
@@ -376,6 +395,8 @@ $$\text{MVF} = \frac{\displaystyle\sum_i \bigl(A_{\text{fiber},i} - A_{\text{axo
 $$\text{N-ratio} = \frac{\displaystyle\sum_{\text{all fibers}} A_{\text{fiber},i}}{A_{\text{fascicle}} - A_{\text{exclusion}}}$$
 
 $$\text{density} = \frac{N}{A_{\text{fascicle}} \cdot 10^{-6}} \quad [\text{axons/mm}^2]$$
+
+$$g_{\text{area-weighted}} = \sqrt{\frac{\sum_i A_{\text{axon},i}}{\sum_i A_{\text{fiber},i}}}$$
 
 ---
 
@@ -412,6 +433,8 @@ AXON_OPEN_PX        = 2    # morphological opening to remove thin protrusions (0
 AXON_MIN_MYELIN_PX  = 2    # hard floor: axon ≥ this many px from fiber edge
 AXON_MIN_MYELIN_FRAC = 0.30 # adaptive floor: axon ≥ frac × fiber_radius from edge
 OUTER_ERODE_PX      = 2    # erode fiber mask before morphometrics (px)
+AXON_INPUT_WHITE_POINT = 255  # clip white point of axon_input (255 = off)
+GRATIO_MAP          = False   # spatial g-ratio heatmap (slow — enable only if needed)
 
 # QC filters (permissive by default — adjust per study)
 MIN_GRATIO             = 0.3
@@ -462,16 +485,19 @@ For each input image `Foo.tif`, results are saved in `output/Foo/`:
 | `Foo_axon_input.png` | Normalized-inverted debug image (axon=dark, myelin=bright) |
 | `Foo_overlay.png` | Full-resolution colour-coded overlay |
 | `Foo_numbered.png` | Overlay with numbered QC-passed axons + stats banner |
-| `Foo_gratio_map.png` | Per-axon g-ratio heatmap (RdYlGn) |
+| `Foo_gratio_map.png` | Per-axon g-ratio heatmap (RdYlGn) — only when `GRATIO_MAP = True` |
 | `Foo_dashboard.png` | Morphometry dashboard |
 | `Foo_morphometrics.csv` | Per-axon measurements (QC-passed only) |
 | `Foo_morphometrics.xlsx` | Same as CSV in Excel format |
 | `Foo_aggregate.csv` | Image-level aggregates (AVF, MVF, N-ratio, density, mean g-ratio) |
 | `Foo_exclusion_mask.npy` | User-drawn exclusion zones (artefacts, tears) |
 | `Foo_edits.json` | Manual edit history (deleted/added fibers) |
+| `Foo_qc_overrides.json` | Fiber labels manually accepted via mode 9 (QC Accept) |
 | `Foo_outer_edited.npy` | Corrected prediction: Cellpose + deletions/modifications (no additions) |
 | `Foo_outer_gt.npy` | Ground truth: Cellpose + deletions/modifications + manual additions |
 | `Foo_axon_inner_original.npy` | Backup of axon labels before editing |
+| `Foo_axon_version.txt` | Cache version marker — triggers axon cache rebuild on version bump |
+| `Foo_*_undo.npy` | Single-level undo snapshots (axon + outer_edited + outer_gt) |
 
 A global `output/summary.csv` collects aggregate metrics across all images.
 
@@ -492,6 +518,7 @@ hybrid-axon-seg/
 ├── visualization.py    # Overlay, numbered image, g-ratio map, dashboard
 ├── compare.py          # Group comparison dashboard
 ├── clean_output.py     # Remove generated files (keep fascicle masks + raws)
+├── test_one.py         # Quick single-image test runner
 └── static/             # Web UI assets (app.js, style.css, index.html)
 ```
 
@@ -524,28 +551,36 @@ img (TIFF)
 
 ## Overlay Color Scheme
 
+The overlay uses fill regions + 1-px contour boundaries:
+
 **QC-passed fibers:**
 ```
-  █  Green   #00F050  Axon contour      — passed all QC filters
-  █  Blue    #4646DC  Myelin ring       — passed all QC filters
+  █  Green    (0,210,60)   Axon fill + (0,240,80) contour
+  █  Blue     (50,50,240)  Myelin fill + contour
 ```
 
-**Rejected fibers (color-coded by rejection reason):**
+**Rejected fibers:**
 ```
-  █  Orange       #FF8C00  G      g-ratio outside [MIN_GRATIO, MAX_GRATIO]
-  █  Red-orange   #FF461E  lgG    large fiber with g-ratio below floor
-  █  Amber        #DCC800  shp    shape discordance (round fiber, irregular axon)
-  █  Purple       #B43CD2  sol    solidity below threshold
-  █  Sky blue     #1EAAE6  off    centroid offset above threshold
-  █  Pink         #F03C8C  ecc    eccentricity above threshold
-  █  Teal         #14C8A0  Ø      axon diameter below resolution limit
-  █  Grey         #A0A0A0  brd    fiber touches image border
+  █  Orange   (255,140,0)  Axon fill + contour — detected but QC rejected
 ```
 
 **Other:**
 ```
-  █  Red     #DC3232  No axon detected  — Otsu found no dark blob in this fiber
-  ─  White            Fascicle boundary — manual or auto-computed envelope
+  █  Red          (220,50,50)   No axon detected — Otsu found no dark blob
+  █  Crimson      (210,50,85)   Multi-core fiber (2+ cores → excluded)
+  ─  White                      Fascicle boundary — manual or auto-computed
+```
+
+**Dashboard rejection breakdown** uses per-reason colors:
+```
+  █  Orange       (255,140,0)   G      g-ratio outside [MIN_GRATIO, MAX_GRATIO]
+  █  Red-orange   (255,70,30)   lgG    large fiber with g-ratio below floor
+  █  Amber        (220,200,0)   shp    shape discordance (round fiber, irregular axon)
+  █  Purple       (180,60,210)  sol    solidity below threshold
+  █  Sky blue     (30,170,230)  off    centroid offset above threshold
+  █  Pink         (240,60,140)  ecc    eccentricity above threshold
+  █  Teal         (20,200,160)  Ø      axon diameter below resolution limit
+  █  Grey         (160,160,160) brd    fiber touches image border
 ```
 
 ---
