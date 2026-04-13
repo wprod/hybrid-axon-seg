@@ -58,7 +58,9 @@ _stem_locks: dict[str, threading.Lock] = {}
 # ── In-memory presence tracking ─────────────────────────────────────────────
 # stem → {client_id: last_seen_unix_ts}  (ephemeral, lost on server restart)
 _presence: dict[str, dict[str, float]] = {}
-_PRESENCE_TTL = 12.0  # seconds before a client is considered gone
+_PRESENCE_TTL = (
+    65.0  # seconds before a client is considered gone (browser throttles bg tabs to ~60s)
+)
 
 
 def _lock(stem: str) -> threading.Lock:
@@ -1189,6 +1191,14 @@ def presence_ping(stem: str, body: PresenceReq):
     # Prune stale clients
     _presence[stem] = {k: v for k, v in stem_map.items() if now - v < _PRESENCE_TTL}
     return {"viewers": len(_presence[stem])}
+
+
+@app.delete("/api/presence/{stem}")
+def presence_leave(stem: str, body: PresenceReq):
+    """Client explicitly leaves a stem (image switch, page close)."""
+    if stem in _presence:
+        _presence[stem].pop(body.client_id, None)
+    return {"ok": True}
 
 
 @app.get("/api/presence")

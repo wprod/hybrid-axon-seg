@@ -98,11 +98,15 @@ class App {
     if (this.stems.length) {
       const hashStem = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
       const initial = (hashStem && this.stems.includes(hashStem)) ? hashStem : this.stems[0];
-      this.select(initial);
+      await this.select(initial);
       $('#hint').classList.add('hidden');
     }
-    // Poll all-presence every 10s to update sidebar badges
+    // Presence: immediate poll + every 10s + re-ping when tab becomes visible again
+    this._pollPresence();
     setInterval(() => this._pollPresence(), 10000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && this.cur) { this._startPresence(this.cur); this._pollPresence(); }
+    });
     window.addEventListener('pagehide', () => this._stopPresence());
     // Resume polling if batch was already running
     try {
@@ -249,6 +253,10 @@ class App {
   }
 
   async select(stem) {
+    if (this.cur && this.cur !== stem) {
+      this._updatePresenceBadge(this.cur, 0);  // clear old badge immediately
+      this._leavePresence(this.cur);
+    }
     this.cur = stem;
     history.replaceState(null, '', '#' + encodeURIComponent(stem));
     $('#current-stem').textContent = stem;
@@ -1398,14 +1406,25 @@ class App {
     this._presenceTimer = setInterval(ping, 5000);
   }
 
+  _leavePresence(stem) {
+    fetch(`/api/presence/${stem}`, {
+      method: 'DELETE', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this._clientId }),
+      keepalive: true,   // survives page unload
+    }).catch(() => {});
+  }
+
   _stopPresence() {
     clearInterval(this._presenceTimer);
+    if (this.cur) this._leavePresence(this.cur);
   }
 
   async _pollPresence() {
     try {
       const counts = await fetch('/api/presence').then(r => r.json());
       this._presenceCounts = counts;
+      // Clear all existing badges first so stale ones (user left) disappear
+      document.querySelectorAll('.presence-badge').forEach(el => el.remove());
       for (const [stem, n] of Object.entries(counts)) this._updatePresenceBadge(stem, n);
     } catch {}
   }
@@ -1414,10 +1433,10 @@ class App {
     const li = document.querySelector(`#img-list li[data-stem="${CSS.escape(stem)}"]`);
     if (!li) return;
     let badge = li.querySelector('.presence-badge');
-    if (n > 1) {
+    if (n >= 1) {
       if (!badge) { badge = document.createElement('span'); badge.className = 'presence-badge'; li.insertBefore(badge, li.querySelector('.img-n')); }
       badge.textContent = `👥 ${n}`;
-      badge.title = `${n} people viewing this image`;
+      badge.title = `${n} person${n > 1 ? 's' : ''} viewing this image`;
     } else if (badge) {
       badge.remove();
     }
