@@ -747,7 +747,12 @@ def set_fascicle(stem: str, req: FascicleReq):
 def paint_outer(stem: str, poly: PolyReq, refresh: bool = True):
     """Paint a new outer-fiber region from a freehand lasso polygon.
 
-    Written to ``_outer_gt.npy`` only (manual addition = model false-negative).
+    If the lasso overlaps an existing fiber (>30% of lasso pixels belong to it),
+    that fiber's outer boundary is extended with the new shape (same label).
+    The 30% threshold is intentionally loose so a partial lasso over the myelin ring
+    still extends the correct fiber rather than creating a duplicate.
+    Otherwise a new label is created (missed detection use-case).
+    Written to ``_outer_gt.npy`` only.
     """
     with _lock(stem):
         from skimage.draw import polygon as draw_polygon
@@ -769,18 +774,28 @@ def paint_outer(stem: str, poly: PolyReq, refresh: bool = True):
         if len(rr) == 0:
             raise HTTPException(400, "Polygon is empty or out of bounds")
 
-        new_label = max(int(edited.max()), int(gt.max()), int(inner.max())) + 1
+        # Check for dominant existing fiber in lasso area
+        existing_vals = gt[rr, cc]
+        nonzero = existing_vals[existing_vals > 0]
+        use_label = None
+        if len(nonzero) > len(rr) * 0.3:
+            dominant = int(np.bincount(nonzero).argmax())
+            if dominant > 0:
+                use_label = dominant
 
-        gt[rr, cc] = new_label
+        if use_label is None:
+            use_label = max(int(edited.max()), int(gt.max()), int(inner.max())) + 1
+
+        gt[rr, cc] = use_label
         np.save(str(d / f"{stem}_outer_gt.npy"), gt)
 
         cx, cy = int(np.mean(xs)), int(np.mean(ys))
         edits = _load_edits(stem)
-        edits["added"].append({"label": int(new_label), "x": cx, "y": cy, "type": "outer"})
+        edits["added"].append({"label": int(use_label), "x": cx, "y": cy, "type": "outer"})
         _save_edits(stem, edits)
 
         refreshed = _fast_overlay(stem) if refresh else False
-        return {"added": new_label, "x": cx, "y": cy, "refreshed": refreshed}
+        return {"added": use_label, "x": cx, "y": cy, "refreshed": refreshed}
 
 
 @app.post("/api/image/{stem}/erase-outer")
