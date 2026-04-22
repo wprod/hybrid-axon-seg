@@ -1227,6 +1227,535 @@ def presence_all():
     }
 
 
+# ── Ground Truth annotation ──────────────────────────────────────────────────
+# Separate workflow for from-scratch annotation on clean images.
+# Images live in ground_truth/images/, masks in ground_truth/masks/.
+
+GT_DIR = Path("ground_truth")
+GT_IMAGES = GT_DIR / "images"
+GT_MASKS = GT_DIR / "masks"
+GT_STATUS = GT_DIR / "status.json"
+
+_gt_locks: dict[str, threading.Lock] = {}
+
+
+def _gt_lock(stem: str) -> threading.Lock:
+    return _gt_locks.setdefault(stem, threading.Lock())
+
+
+def _gt_stems() -> list[str]:
+    """List stems available in ground_truth/images/."""
+    if not GT_IMAGES.exists():
+        return []
+    exts = {".tif", ".tiff", ".png"}
+    return sorted({clean_stem(p) for p in GT_IMAGES.iterdir() if p.suffix.lower() in exts})
+
+
+def _gt_find_raw(stem: str) -> Path | None:
+    for ext in (".tif", ".tiff", ".png"):
+        for p in GT_IMAGES.glob(f"*{ext}"):
+            if clean_stem(p) == stem:
+                return p
+    return None
+
+
+def _gt_load_vessels(stem: str) -> np.ndarray:
+    p = GT_MASKS / f"{stem}_vessels_gt.npy"
+    if p.exists():
+        return np.load(str(p))
+    raw = _gt_find_raw(stem)
+    if raw is None:
+        raise HTTPException(404, f"GT image not found: {stem}")
+    img = io.imread(str(raw))
+    return np.zeros(img.shape[:2], dtype=np.int32)
+
+
+def _gt_load_outer(stem: str) -> np.ndarray:
+    p = GT_MASKS / f"{stem}_outer_gt.npy"
+    if p.exists():
+        return np.load(str(p))
+    # Create empty array matching image shape
+    raw = _gt_find_raw(stem)
+    if raw is None:
+        raise HTTPException(404, f"GT image not found: {stem}")
+    img = io.imread(str(raw))
+    return np.zeros(img.shape[:2], dtype=np.int32)
+
+
+def _gt_load_inner(stem: str) -> np.ndarray:
+    p = GT_MASKS / f"{stem}_axon_gt.npy"
+    if p.exists():
+        return np.load(str(p))
+    raw = _gt_find_raw(stem)
+    if raw is None:
+        raise HTTPException(404, f"GT image not found: {stem}")
+    img = io.imread(str(raw))
+    return np.zeros(img.shape[:2], dtype=np.int32)
+
+
+def _gt_save(stem: str, outer: np.ndarray, inner: np.ndarray) -> None:
+    GT_MASKS.mkdir(parents=True, exist_ok=True)
+    np.save(str(GT_MASKS / f"{stem}_outer_gt.npy"), outer)
+    np.save(str(GT_MASKS / f"{stem}_axon_gt.npy"), inner)
+
+
+def _gt_snapshot_undo(stem: str) -> None:
+    for suffix in ("outer_gt", "axon_gt", "vessels_gt"):
+        src = GT_MASKS / f"{stem}_{suffix}.npy"
+        if src.exists():
+            shutil.copy2(src, GT_MASKS / f"{stem}_{suffix}_undo.npy")
+
+
+def _gt_overlay(stem: str) -> bool:
+    """Generate clean GT overlay: filled zones, no contour lines."""
+    from utils import to_rgb_uint8
+
+    raw_path = _gt_find_raw(stem)
+    if raw_path is None:
+        return False
+
+    img = io.imread(str(raw_path))
+    if img.ndim == 3 and img.shape[2] == 4:
+        img = img[:, :, :3]
+
+    outer = _gt_load_outer(stem)
+    inner = _gt_load_inner(stem)
+
+    rgb = to_rgb_uint8(img)
+    ov = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
+
+    def blend(mask, color, alpha=0.55):
+        c = np.array(color, dtype=np.float32)
+        ov[mask] = np.clip(ov[mask].astype(np.float32) * (1 - alpha) + c * alpha, 0, 255).astype(
+            np.uint8
+        )
+
+    vessels = _gt_load_vessels(stem)
+
+    axon = inner > 0
+    myelin = (outer > 0) & ~axon
+    vessel = vessels > 0
+
+    blend(myelin, [60, 60, 240])  # blue myelin
+    blend(axon, [0, 220, 70])  # green axon
+    blend(vessel, [220, 40, 40])  # red vessels
+
+    GT_MASKS.mkdir(parents=True, exist_ok=True)
+    io.imsave(str(GT_MASKS / f"{stem}_overlay.png"), ov, check_contrast=False)
+    return True
+
+
+def _gt_load_status() -> dict:
+    if GT_STATUS.exists():
+        return json.loads(GT_STATUS.read_text())
+    return {}
+
+
+def _gt_save_status(status: dict) -> None:
+    GT_STATUS.write_text(json.dumps(status, indent=2))
+
+
+@app.get("/api/gt/images")
+def gt_list_images():
+    stems = _gt_stems()
+    status = _gt_load_status()
+    images = []
+    for stem in stems:
+        outer_path = GT_MASKS / f"{stem}_outer_gt.npy"
+        n_fibers = 0
+        if outer_path.exists():
+            outer = np.load(str(outer_path))
+            n_fibers = len(np.unique(outer)) - 1  # exclude 0
+        images.append({
+            "stem": stem,
+            "n_fibers": n_fibers,
+            "status": status.get(stem, "pending"),
+        })
+    return images
+
+
+@app.get("/api/gt/image/{stem}/raw")
+def gt_get_raw(stem: str):
+    from utils import to_rgb_uint8
+
+    GT_MASKS.mkdir(parents=True, exist_ok=True)
+    png_cache = GT_MASKS / f"{stem}_raw.png"
+    if not png_cache.exists():
+        raw_path = _gt_find_raw(stem)
+        if raw_path is None:
+            raise HTTPException(404, f"GT image not found: {stem}")
+        img = io.imread(str(raw_path))
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, :3]
+        io.imsave(str(png_cache), to_rgb_uint8(img), check_contrast=False)
+    return FileResponse(str(png_cache), media_type="image/png")
+
+
+@app.get("/api/gt/image/{stem}/overlay")
+def gt_get_overlay(stem: str):
+    overlay_path = GT_MASKS / f"{stem}_overlay.png"
+    # Always regenerate to stay fresh (GT images have few fibers, it's fast)
+    if not _gt_overlay(stem):
+        raise HTTPException(404)
+    return FileResponse(str(overlay_path), media_type="image/png")
+
+
+@app.get("/api/gt/image/{stem}/info")
+def gt_get_info(stem: str):
+    outer = _gt_load_outer(stem)
+    inner = _gt_load_inner(stem)
+    vessels = _gt_load_vessels(stem)
+    fibers = []
+    for p in measure.regionprops(outer):
+        if p.label == 0:
+            continue
+        cy, cx = int(p.centroid[0]), int(p.centroid[1])
+        has_axon = bool((inner == p.label).any())
+        fibers.append({"label": int(p.label), "x": cx, "y": cy, "has_axon": has_axon})
+    n_vessels = len(np.unique(vessels)) - 1  # exclude 0
+    raw_path = _gt_find_raw(stem)
+    shape = list(outer.shape) if outer.size > 0 else [0, 0]
+    if shape == [0, 0] and raw_path:
+        img = io.imread(str(raw_path))
+        shape = list(img.shape[:2])
+    return {
+        "stem": stem,
+        "fibers": fibers,
+        "n_fibers": len(fibers),
+        "n_vessels": n_vessels,
+        "image_shape": shape,
+        "status": _gt_load_status().get(stem, "pending"),
+    }
+
+
+@app.post("/api/gt/image/{stem}/add-fiber")
+def gt_add_fiber(stem: str, req: FiberReq, refresh: bool = True):
+    """Add a fiber (outer + inner polygon) to GT masks."""
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(req.outer_points) < 3 or len(req.inner_points) < 3:
+            raise HTTPException(400, "Both polygons need at least 3 points")
+
+        _gt_snapshot_undo(stem)
+
+        outer = _gt_load_outer(stem)
+        inner = _gt_load_inner(stem)
+
+        # Rasterise outer polygon
+        o_xs = [p[0] for p in req.outer_points]
+        o_ys = [p[1] for p in req.outer_points]
+        o_rr, o_cc = draw_polygon(o_ys, o_xs, shape=outer.shape)
+        if len(o_rr) == 0:
+            raise HTTPException(400, "Outer polygon is empty or out of bounds")
+
+        # Rasterise inner polygon
+        i_xs = [p[0] for p in req.inner_points]
+        i_ys = [p[1] for p in req.inner_points]
+        i_rr, i_cc = draw_polygon(i_ys, i_xs, shape=inner.shape)
+        if len(i_rr) == 0:
+            raise HTTPException(400, "Inner polygon is empty or out of bounds")
+
+        new_label = max(int(outer.max()), int(inner.max())) + 1
+
+        outer[o_rr, o_cc] = new_label
+        inner[i_rr, i_cc] = new_label
+        _gt_save(stem, outer, inner)
+
+        cx, cy = int(np.mean(i_xs)), int(np.mean(i_ys))
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"added": new_label, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/delete")
+def gt_delete(stem: str, pt: PointReq, refresh: bool = True):
+    """Delete a fiber or vessel from GT masks at the given point."""
+    with _gt_lock(stem):
+        _gt_snapshot_undo(stem)
+        outer = _gt_load_outer(stem)
+        inner = _gt_load_inner(stem)
+        vessels = _gt_load_vessels(stem)
+        y, x = pt.y, pt.x
+
+        if not (0 <= y < outer.shape[0] and 0 <= x < outer.shape[1]):
+            raise HTTPException(400, "Coordinates out of bounds")
+
+        # Check vessels first, then fibers
+        vlabel = int(vessels[y, x])
+        if vlabel > 0:
+            ys, xs = np.where(vessels == vlabel)
+            cx, cy = int(xs.mean()), int(ys.mean())
+            vessels[vessels == vlabel] = 0
+            GT_MASKS.mkdir(parents=True, exist_ok=True)
+            np.save(str(GT_MASKS / f"{stem}_vessels_gt.npy"), vessels)
+            refreshed = _gt_overlay(stem) if refresh else False
+            return {"deleted": vlabel, "type": "vessel", "x": cx, "y": cy, "refreshed": refreshed}
+
+        label = int(outer[y, x])
+        if label == 0:
+            label = int(inner[y, x])
+        if label == 0:
+            raise HTTPException(404, "No fiber or vessel found at this position")
+
+        ys, xs = np.where(outer == label)
+        if len(ys) == 0:
+            ys, xs = np.where(inner == label)
+        cx, cy = int(xs.mean()), int(ys.mean())
+
+        outer[outer == label] = 0
+        inner[inner == label] = 0
+        _gt_save(stem, outer, inner)
+
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"deleted": label, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/paint-outer")
+def gt_paint_outer(stem: str, poly: PolyReq, refresh: bool = True):
+    """Paint an outer-fiber region in GT mode.
+
+    If the lasso overlaps an existing fiber (>30%), that fiber is extended.
+    Otherwise a new fiber is created.
+    """
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(poly.points) < 3:
+            raise HTTPException(400, "Need at least 3 points")
+
+        _gt_snapshot_undo(stem)
+        outer = _gt_load_outer(stem)
+        inner = _gt_load_inner(stem)
+
+        xs = [p[0] for p in poly.points]
+        ys = [p[1] for p in poly.points]
+        rr, cc = draw_polygon(ys, xs, shape=outer.shape)
+        if len(rr) == 0:
+            raise HTTPException(400, "Polygon is empty or out of bounds")
+
+        # Check for dominant existing fiber in lasso area
+        existing_vals = outer[rr, cc]
+        nonzero = existing_vals[existing_vals > 0]
+        use_label = None
+        if len(nonzero) > len(rr) * 0.3:
+            dominant = int(np.bincount(nonzero).argmax())
+            if dominant > 0:
+                use_label = dominant
+
+        if use_label is None:
+            use_label = max(int(outer.max()), int(inner.max())) + 1
+
+        outer[rr, cc] = use_label
+        _gt_save(stem, outer, inner)
+
+        cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"added": use_label, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/paint-axon")
+def gt_paint_axon(stem: str, poly: PolyReq, refresh: bool = True):
+    """Paint axon inside an existing GT fiber."""
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(poly.points) < 3:
+            raise HTTPException(400, "Need at least 3 points")
+
+        _gt_snapshot_undo(stem)
+        outer = _gt_load_outer(stem)
+        inner = _gt_load_inner(stem)
+
+        xs = [p[0] for p in poly.points]
+        ys = [p[1] for p in poly.points]
+        rr, cc = draw_polygon(ys, xs, shape=outer.shape)
+        if len(rr) == 0:
+            raise HTTPException(400, "Polygon is empty or out of bounds")
+
+        # Find which fiber the polygon is mostly inside
+        fiber_vals = outer[rr, cc]
+        fiber_vals = fiber_vals[fiber_vals > 0]
+        if len(fiber_vals) == 0:
+            raise HTTPException(400, "Polygon is not inside any fiber")
+        fiber_label = int(np.bincount(fiber_vals).argmax())
+
+        # Only fill pixels belonging to that fiber
+        mask = outer[rr, cc] == fiber_label
+        rr, cc = rr[mask], cc[mask]
+        inner[rr, cc] = fiber_label
+        _gt_save(stem, outer, inner)
+
+        cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"added": fiber_label, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/erase")
+def gt_erase(stem: str, poly: PolyReq, refresh: bool = True):
+    """Erase outer + inner mask within a lasso polygon."""
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(poly.points) < 3:
+            raise HTTPException(400, "Need at least 3 points")
+
+        _gt_snapshot_undo(stem)
+        outer = _gt_load_outer(stem)
+        inner = _gt_load_inner(stem)
+
+        xs = [p[0] for p in poly.points]
+        ys = [p[1] for p in poly.points]
+        rr, cc = draw_polygon(ys, xs, shape=outer.shape)
+        if len(rr) == 0:
+            raise HTTPException(400, "Polygon is empty or out of bounds")
+
+        outer[rr, cc] = 0
+        inner[rr, cc] = 0
+        _gt_save(stem, outer, inner)
+
+        cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"erased": True, "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/add-vessel")
+def gt_add_vessel(stem: str, poly: PolyReq, refresh: bool = True):
+    """Paint a vessel region in GT mode."""
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(poly.points) < 3:
+            raise HTTPException(400, "Need at least 3 points")
+
+        _gt_snapshot_undo(stem)
+        vessels = _gt_load_vessels(stem)
+
+        xs = [p[0] for p in poly.points]
+        ys = [p[1] for p in poly.points]
+        rr, cc = draw_polygon(ys, xs, shape=vessels.shape)
+        if len(rr) == 0:
+            raise HTTPException(400, "Polygon is empty or out of bounds")
+
+        new_label = int(vessels.max()) + 1
+        vessels[rr, cc] = new_label
+        GT_MASKS.mkdir(parents=True, exist_ok=True)
+        np.save(str(GT_MASKS / f"{stem}_vessels_gt.npy"), vessels)
+
+        cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        refreshed = _gt_overlay(stem) if refresh else False
+        return {"added": new_label, "type": "vessel", "x": cx, "y": cy, "refreshed": refreshed}
+
+
+@app.post("/api/gt/image/{stem}/undo")
+def gt_undo(stem: str):
+    """Restore GT masks from single-level undo snapshot."""
+    with _gt_lock(stem):
+        restored = False
+        for suffix in ("outer_gt", "axon_gt", "vessels_gt"):
+            snap = GT_MASKS / f"{stem}_{suffix}_undo.npy"
+            dst = GT_MASKS / f"{stem}_{suffix}.npy"
+            if snap.exists():
+                shutil.copy2(snap, dst)
+                snap.unlink()
+                restored = True
+        if not restored:
+            raise HTTPException(404, "Nothing to undo")
+        _gt_overlay(stem)
+        return {"status": "ok"}
+
+
+@app.post("/api/gt/image/{stem}/validate")
+def gt_validate(stem: str):
+    """Toggle validation status for a GT image."""
+    with _gt_lock(stem):
+        status = _gt_load_status()
+        current = status.get(stem, "pending")
+        status[stem] = "pending" if current == "validated" else "validated"
+        _gt_save_status(status)
+        return {"status": status[stem]}
+
+
+@app.post("/api/gt/image/{stem}/rebuild-overlay")
+def gt_rebuild_overlay(stem: str):
+    """Regenerate GT overlay after deferred edits."""
+    with _gt_lock(stem):
+        _gt_overlay(stem)
+        return {"status": "ok"}
+
+
+@app.post("/api/gt/image/{stem}/set-fascicle")
+def gt_set_fascicle(stem: str, req: FascicleReq):
+    """Rasterise a user-drawn polygon → save as GT fascicle mask."""
+    with _gt_lock(stem):
+        from skimage.draw import polygon as draw_polygon
+
+        if len(req.points) < 3:
+            raise HTTPException(400, "Need at least 3 points")
+
+        GT_MASKS.mkdir(parents=True, exist_ok=True)
+
+        # Resolve image shape from existing GT outer mask or raw image
+        outer_path = GT_MASKS / f"{stem}_outer_gt.npy"
+        if outer_path.exists():
+            shape = np.load(str(outer_path), mmap_mode="r").shape
+        else:
+            raw_path = _gt_find_raw(stem)
+            if raw_path is None:
+                raise HTTPException(404, f"GT image not found: {stem}")
+            img = io.imread(str(raw_path))
+            shape = img.shape[:2]
+
+        xs = [p[0] for p in req.points]
+        ys = [p[1] for p in req.points]
+        rr, cc = draw_polygon(ys, xs, shape=shape)
+        mask = np.zeros(shape, dtype=bool)
+        if len(rr) > 0:
+            mask[rr, cc] = True
+
+        # Union with existing mask (supports multi-fascicle nerves)
+        existing = GT_MASKS / f"{stem}_fascicle_mask_gt.npy"
+        if existing.exists():
+            prev = np.load(str(existing))
+            if prev.shape == mask.shape:
+                mask = mask | prev
+
+        np.save(str(existing), mask)
+        return {"status": "ok", "area_px": int(mask.sum())}
+
+
+@app.get("/api/gt/image/{stem}/fascicle")
+def gt_get_fascicle_contour(stem: str, t: int = 0):
+    """Return the saved GT fascicle boundary as downsampled polygons."""
+    from skimage.measure import find_contours
+
+    mask_path = GT_MASKS / f"{stem}_fascicle_mask_gt.npy"
+    if not mask_path.exists():
+        return {"points": None}
+
+    mask = np.load(str(mask_path))
+    contours = find_contours(mask.astype(np.float32), 0.5)
+    if not contours:
+        return {"contours": []}
+
+    result = []
+    for contour in sorted(contours, key=len, reverse=True):
+        if len(contour) < 40:
+            continue
+        step = max(1, len(contour) // 300)
+        result.append([[int(c[1]), int(c[0])] for c in contour[::step]])
+    return {"contours": result if result else []}
+
+
+@app.post("/api/gt/image/{stem}/clear-fascicle")
+def gt_clear_fascicle(stem: str):
+    """Delete the GT fascicle mask."""
+    with _gt_lock(stem):
+        mask_path = GT_MASKS / f"{stem}_fascicle_mask_gt.npy"
+        if mask_path.exists():
+            mask_path.unlink()
+        return {"status": "ok"}
+
+
 @app.get("/api/comparison")
 def get_comparison():
     for name in ("comparison_dashboard.png", "comparison.png"):
