@@ -7,3 +7,6 @@ output/
 raw/
 axons/
 edited/
+ground_truth/
+CLAUDE.md
+STRATEGY.md
