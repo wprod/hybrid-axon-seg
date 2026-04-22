@@ -24,7 +24,7 @@ def process_fibers(
     outer_labels: np.ndarray,
     axon_assignments: dict,  # fiber_label → (r0, c0, crop_bool)
     pixel_size: float,  # µm / px
-) -> tuple[np.ndarray, dict, pd.DataFrame, np.ndarray, dict]:
+) -> tuple[np.ndarray, dict, pd.DataFrame, np.ndarray]:
     """Compute morphometrics for every detected axon.
 
     Returns
@@ -33,7 +33,6 @@ def process_fibers(
     pairs         : dict  fiber_label → fiber_label  (matched fibers)
     df            : DataFrame with one row per axon
     index_image   : int32 array mapping pixels to sequential axon IDs
-    agg           : dict of aggregate metrics (AVF, MVF, …)
     """
     fiber_rprops = {p.label: p for p in measure.regionprops(outer_labels)}
     img_h, img_w = outer_labels.shape
