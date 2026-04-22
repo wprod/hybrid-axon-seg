@@ -45,6 +45,9 @@ class App {
     this._pinchDist = 0;
     this._pinchMid = null;
 
+    // GT mode
+    this.gtMode = false;
+
     // processed state per stem
     this.processedMap = new Map();
 
@@ -94,12 +97,32 @@ class App {
       const btn = $('[data-view="gratio_map"]');
       if (btn) btn.classList.add('hidden');
     }
-    await this.loadList();
-    if (this.stems.length) {
-      const hashStem = location.hash ? decodeURIComponent(location.hash.slice(1)) : null;
-      const initial = (hashStem && this.stems.includes(hashStem)) ? hashStem : this.stems[0];
-      await this.select(initial);
-      $('#hint').classList.add('hidden');
+    // Restore mode + stem from URL hash  (#gt:stem  or  #stem)
+    const hash = location.hash ? decodeURIComponent(location.hash.slice(1)) : '';
+    const isGt = hash.startsWith('gt:');
+    const hashStem = isGt ? hash.slice(3) : hash;
+
+    if (isGt) {
+      this.gtMode = true;
+      $('#btn-gt-toggle').classList.add('active');
+      $('#gt-banner').classList.remove('hidden');
+      $('#btn-recompute').classList.add('hidden');
+      $('#btn-reset').classList.add('hidden');
+      $('#btn-recompute-all').classList.add('hidden');
+      $$('.view-btn').forEach(b => b.classList.add('hidden'));
+      $('#btn-compare').classList.add('hidden');
+      $('[data-mode="accept"]').classList.add('hidden');
+      $('[data-mode="vessel"]').classList.remove('hidden');
+      $('#gt-validate-panel').classList.remove('hidden');
+      await this._loadGtList();
+      if (hashStem) { await this._gtSelect(hashStem); $('#hint').classList.add('hidden'); }
+    } else {
+      await this.loadList();
+      if (this.stems.length) {
+        const initial = (hashStem && this.stems.includes(hashStem)) ? hashStem : this.stems[0];
+        await this.select(initial);
+        $('#hint').classList.add('hidden');
+      }
     }
     // Presence: immediate poll + every 10s + re-ping when tab becomes visible again
     this._pollPresence();
@@ -123,6 +146,7 @@ class App {
 
   bindEvents() {
     $$('.mode-btn').forEach(b => b.onclick = () => this.setMode(b.dataset.mode));
+    $('#btn-gt-toggle').onclick = () => this.toggleGtMode();
     $('#btn-undo').onclick = () => this.undo();
     $('#btn-recompute').onclick = () => this.recompute();
     $('#btn-reset').onclick = () => this.reset();
@@ -207,7 +231,7 @@ class App {
       const hintLabels = {
         delete: 'Delete', fiber: '+Fiber', fascicle: 'Fascicle',
         'paint-axon': '+Axon', 'paint-outer': '+Myelin', 'erase-outer': 'Erase',
-        exclude: 'Exclude', accept: 'Accept QC',
+        exclude: 'Exclude', accept: 'Accept QC', vessel: 'Vessel',
       };
       const lbl = hintLabels[m];
       if (lbl) { hintEl.className = `m-${m}`; hintEl.textContent = lbl; }
@@ -221,6 +245,7 @@ class App {
       'paint-axon': 'Drag lasso → fills axon',
       'paint-outer': 'Drag lasso → fills myelin sheath',
       'erase-outer': 'Drag lasso → erases myelin + axon',
+      'vessel': 'Drag lasso → marks blood vessel',
     };
     if (toasts[m]) this.toast(toasts[m], 'info');
     this.render();
@@ -229,6 +254,7 @@ class App {
   /* ── Image list ──────────────────────────────────────────────────────── */
 
   async loadList() {
+    if (this.gtMode) return this._loadGtList();
     const r = await fetch('/api/images');
     const imgs = await r.json();
     this.stems = imgs.map(i => i.stem);
@@ -252,7 +278,62 @@ class App {
     $('#img-count').textContent = imgs.length;
   }
 
+  /* ── GT Mode ──────────────────────────────────────────────────────────── */
+
+  async toggleGtMode() {
+    this.gtMode = !this.gtMode;
+    $('#btn-gt-toggle').classList.toggle('active', this.gtMode);
+    $('#gt-banner').classList.toggle('hidden', !this.gtMode);
+    // Hide production-only controls in GT mode
+    $('#btn-recompute').classList.toggle('hidden', this.gtMode);
+    $('#btn-reset').classList.toggle('hidden', this.gtMode);
+    $('#btn-recompute-all').classList.toggle('hidden', this.gtMode);
+    $$('.view-btn').forEach(b => b.classList.toggle('hidden', this.gtMode));
+    $('#btn-compare').classList.toggle('hidden', this.gtMode);
+    // Hide modes not relevant in GT / show GT-only modes
+    $('[data-mode="accept"]').classList.toggle('hidden', this.gtMode);
+    $('[data-mode="vessel"]').classList.toggle('hidden', !this.gtMode);
+    // Show/hide GT validate button
+    $('#gt-validate-panel').classList.toggle('hidden', !this.gtMode);
+
+    this.cur = null;
+    this.img = null;
+    this.rawImg = null;
+    await this.loadList();
+    if (this.stems.length) {
+      await this.select(this.stems[0]);
+    }
+  }
+
+  async _loadGtList() {
+    const r = await fetch('/api/gt/images');
+    const imgs = await r.json();
+    this.stems = imgs.map(i => i.stem);
+    const ul = $('#img-list');
+    ul.innerHTML = '';
+    let nValidated = 0;
+    for (const i of imgs) {
+      const li = document.createElement('li');
+      li.dataset.stem = i.stem;
+      const validated = i.status === 'validated';
+      if (validated) nValidated++;
+      const dotCls = validated ? 'gt-done' : (i.n_fibers > 0 ? 'gt-wip' : 'gt-todo');
+      const nLabel = i.n_fibers > 0 ? `n=${i.n_fibers}` : 'empty';
+      const checkBadge = validated ? '<span class="gt-check">✓</span>' : '';
+      li.innerHTML =
+        `<span class="dot ${dotCls}"></span>` +
+        `<span class="img-name" title="${i.stem}">${i.stem}</span>` +
+        `${checkBadge}` +
+        `<span class="img-n">${nLabel}</span>`;
+      li.onclick = () => this.select(i.stem);
+      ul.appendChild(li);
+    }
+    $('#img-count').textContent = imgs.length;
+    $('#gt-progress').textContent = `${nValidated}/${imgs.length}`;
+  }
+
   async select(stem) {
+    if (this.gtMode) return this._gtSelect(stem);
     if (this.cur && this.cur !== stem) {
       this._updatePresenceBadge(this.cur, 0);  // clear old badge immediately
       this._leavePresence(this.cur);
@@ -274,22 +355,15 @@ class App {
     this.render();
     $('#loading').classList.remove('hidden');
 
-    const loadImg = src => new Promise((res, rej) => {
-      const im = new Image();
-      im.onload = () => res(im);
-      im.onerror = rej;
-      im.src = src;
-    });
-
     (async () => {
       const t = Date.now();
       let im = null;
       let fromRaw = false;
       try {
-        im = await loadImg(`/api/image/${stem}/overlay?t=${t}`);
+        im = await this._loadImg(`/api/image/${stem}/overlay?t=${t}`);
       } catch {
         try {
-          im = await loadImg(`/api/image/${stem}/raw?t=${t}`);
+          im = await this._loadImg(`/api/image/${stem}/raw?t=${t}`);
           fromRaw = true;
         } catch {
           if (this.cur !== stem) return;
@@ -322,6 +396,115 @@ class App {
     })();
   }
 
+  _loadImg(src) {
+    return new Promise((res, rej) => {
+      const im = new Image();
+      im.onload = () => res(im);
+      im.onerror = rej;
+      im.src = src;
+    });
+  }
+
+  async _gtSelect(stem) {
+    if (this.cur && this.cur !== stem) {
+      this._updatePresenceBadge(this.cur, 0);
+      this._leavePresence(this.cur);
+    }
+    this.cur = stem;
+    this._startPresence(stem);
+    history.replaceState(null, '', '#gt:' + encodeURIComponent(stem));
+    $('#current-stem').textContent = stem;
+    $$('#img-list li').forEach(li => li.classList.toggle('active', li.dataset.stem === stem));
+
+    this.img = null;
+    this.rawImg = null;
+    this.anns = [];
+    this.editCount = 0;
+    this.savedFasc = null;
+    this.savedExcl = null;
+    this._showFasciclePanel(false);
+    this._showExclusionPanel(false);
+    this.render();
+    $('#loading').classList.remove('hidden');
+
+    const t = Date.now();
+    try {
+      // Load raw image first
+      const rawIm = await this._loadImg(`/api/gt/image/${stem}/raw?t=${t}`);
+      if (this.cur !== stem) return;
+      this.rawImg = rawIm;
+
+      // Try overlay (may be empty if no annotations yet)
+      try {
+        const ovIm = await this._loadImg(`/api/gt/image/${stem}/overlay?t=${t}`);
+        if (this.cur !== stem) return;
+        this.img = ovIm;
+      } catch {
+        this.img = rawIm;
+      }
+
+      $('#loading').classList.add('hidden');
+      $('#hint').classList.add('hidden');
+      this.fit();
+
+      // Load GT info
+      const r = await fetch(`/api/gt/image/${stem}/info`);
+      const info = await r.json();
+      if (this.cur !== stem) return;
+      this._showGtMetrics(info);
+      this.loadFascicle(stem);
+      this.render();
+    } catch {
+      if (this.cur !== stem) return;
+      $('#loading').classList.add('hidden');
+      this.toast('GT image not found', 'err');
+    }
+  }
+
+  _showGtMetrics(info) {
+    const fill = (tbl, data) => {
+      const tb = tbl.querySelector('tbody');
+      tb.innerHTML = '';
+      for (const r of data) {
+        const tr = document.createElement('tr');
+        if (r[2]) tr.className = 'hl';
+        tr.innerHTML = `<td>${r[0]}</td><td>${r[1]}</td>`;
+        tb.appendChild(tr);
+      }
+    };
+    const rows = [
+      ['Fibers annotated', info.n_fibers, true],
+      ['With axon',  info.fibers.filter(f => f.has_axon).length, true],
+      ['Without axon', info.fibers.filter(f => !f.has_axon).length, false],
+      ['Vessels', info.n_vessels || 0, (info.n_vessels || 0) > 0],
+      ['Status', info.status === 'validated' ? '✓ Validated' : 'In progress', info.status === 'validated'],
+    ];
+    fill($('#tbl-metrics'), rows);
+    fill($('#tbl-seg'), []);
+    $('#edit-info').textContent = '';
+    $('#panel').classList.remove('stale');
+
+    // Update validate button state
+    const vBtn = $('#btn-gt-validate');
+    if (vBtn) {
+      vBtn.textContent = info.status === 'validated' ? '✓ Validated' : 'Mark Validated';
+      vBtn.classList.toggle('validated', info.status === 'validated');
+    }
+  }
+
+  async gtValidate() {
+    if (!this.cur || !this.gtMode) return;
+    try {
+      const r = await fetch(`/api/gt/image/${this.cur}/validate`, { method: 'POST' });
+      const d = await r.json();
+      this.toast(d.status === 'validated' ? 'Image validated' : 'Validation removed', 'ok');
+      await this._loadGtList();
+      // Refresh info panel
+      const info = await fetch(`/api/gt/image/${this.cur}/info`).then(r => r.json());
+      this._showGtMetrics(info);
+    } catch (err) { this.toast(err.message, 'err'); }
+  }
+
   async loadInfo(stem) {
     const r = await fetch(`/api/image/${stem}/info`);
     const info = await r.json();
@@ -334,7 +517,8 @@ class App {
 
   async loadFascicle(stem) {
     try {
-      const r = await fetch(`/api/image/${stem}/fascicle?t=${Date.now()}`);
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      const r = await fetch(`${prefix}/image/${stem}/fascicle?t=${Date.now()}`);
       if (!r.ok) return;
       const d = await r.json();
       if (this.cur !== stem) return;
@@ -368,7 +552,8 @@ class App {
   async clearFascicle() {
     if (!this.cur) return;
     try {
-      await fetch(`/api/image/${this.cur}/clear-fascicle`, { method: 'POST' });
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      await fetch(`${prefix}/image/${this.cur}/clear-fascicle`, { method: 'POST' });
       this.savedFasc = null;
       this._showFasciclePanel(false);
       if (this.mode === 'fascicle') this.setMode('navigate');
@@ -689,6 +874,7 @@ class App {
     if (this.mode === 'paint-axon') return '#66bb6a';
     if (this.mode === 'paint-outer') return '#9b59b6';
     if (this.mode === 'erase-outer') return '#ef5350';
+    if (this.mode === 'vessel') return '#e74c3c';
     if (this.mode === 'fiber' && this.fiberStep === 0) return '#9b59b6';
     if (this.mode === 'fiber' && this.fiberStep === 1) return '#66bb6a';
     return '#4fc3f7';
@@ -698,6 +884,7 @@ class App {
     if (this.mode === 'paint-axon') return 'rgba(102,187,106,0.15)';
     if (this.mode === 'paint-outer') return 'rgba(155,89,182,0.12)';
     if (this.mode === 'erase-outer') return 'rgba(239,83,80,0.12)';
+    if (this.mode === 'vessel') return 'rgba(231,76,60,0.15)';
     if (this.mode === 'fiber' && this.fiberStep === 0) return 'rgba(155,89,182,0.12)';
     if (this.mode === 'fiber' && this.fiberStep === 1) return 'rgba(102,187,106,0.15)';
     return 'rgba(79,195,247,0.12)';
@@ -765,7 +952,7 @@ class App {
     if (this.mode === 'accept') { this.clickAccept(e); return; }
 
     // Freehand lasso modes
-    if (['fiber', 'paint-axon', 'paint-outer', 'erase-outer'].includes(this.mode)) {
+    if (['fiber', 'paint-axon', 'paint-outer', 'erase-outer', 'vessel'].includes(this.mode)) {
       this.drawing = true;
       this.drawPts = [this.s2i(e)];
     }
@@ -881,6 +1068,8 @@ class App {
         this.submitPaintOuter(sampled);
       } else if (this.mode === 'erase-outer') {
         this.submitEraseOuter(sampled);
+      } else if (this.mode === 'vessel') {
+        this.submitVessel(sampled);
       }
     }
     this.drawing = false; this.drawPts = [];
@@ -969,12 +1158,13 @@ class App {
     if (e.key === '7') this.setMode('fascicle');
     if (e.key === '8') this.setMode('exclude');
     if (e.key === '9') this.setMode('accept');
+    if (e.key === '0' && this.gtMode) this.setMode('vessel');
     if (e.key === 'Escape') {
       if (this.mode === 'fiber' && (this.drawing || this.fiberStep > 0)) {
         this.fiberStep = 0; this.outerPoly = []; this.drawPts = [];
         this.drawing = false; this.render(); this.toast('Cancelled', 'info');
       }
-      if (['paint-axon', 'paint-outer', 'erase-outer'].includes(this.mode) && this.drawing) {
+      if (['paint-axon', 'paint-outer', 'erase-outer', 'vessel'].includes(this.mode) && this.drawing) {
         this.drawing = false; this.drawPts = []; this.render(); this.toast('Cancelled', 'info');
       }
       if (this.mode === 'fascicle' && this.fascPts.length > 0) {
@@ -1007,10 +1197,11 @@ class App {
   reloadOverlay() {
     const stem = this.cur;
     if (!stem) return;
+    const prefix = this.gtMode ? '/api/gt' : '/api';
     const im = new Image();
     im.onload = () => { if (this.cur !== stem) return; this.img = im; this.anns = []; this.showBusy(false); this.render(); };
     im.onerror = () => this.showBusy(false);
-    im.src = `/api/image/${stem}/overlay?t=${Date.now()}`;
+    im.src = `${prefix}/image/${stem}/overlay?t=${Date.now()}`;
   }
 
   async clickDelete(e) {
@@ -1022,8 +1213,9 @@ class App {
     this._enqueue(async () => {
       if (this.cur !== stem) { this._removeAnn(pAnn); return; }
       let resp;
+      const prefix = this.gtMode ? '/api/gt' : '/api';
       try {
-        resp = await fetch(`/api/image/${stem}/delete?refresh=false`, {
+        resp = await fetch(`${prefix}/image/${stem}/delete?refresh=false`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ x: pt.x, y: pt.y }),
         });
@@ -1067,7 +1259,8 @@ class App {
     this.showBusy(true, 'Adding fiber...');
     this.render();
     try {
-      const r = await fetch(`/api/image/${this.cur}/add-fiber`, {
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      const r = await fetch(`${prefix}/image/${this.cur}/add-fiber`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ outer_points: outer.map(p => [p.x, p.y]), inner_points: innerPts.map(p => [p.x, p.y]) }),
       });
@@ -1077,6 +1270,10 @@ class App {
       this.editCount++; this.showEditCount();
       this.toast(`Fiber #${d.added} added`, 'ok');
       if (d.refreshed) this.reloadOverlay(); else this.showBusy(false);
+      if (this.gtMode) {
+        this._loadGtList();
+        fetch(`/api/gt/image/${this.cur}/info`).then(r => r.json()).then(info => this._showGtMetrics(info)).catch(() => {});
+      }
     } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
   }
 
@@ -1088,8 +1285,10 @@ class App {
     this._enqueue(async () => {
       if (this.cur !== stem) { this._removeAnn(pAnn); return; }
       let resp;
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      const endpoint = this.gtMode ? 'paint-axon' : 'add';
       try {
-        resp = await fetch(`/api/image/${stem}/add?refresh=false`, {
+        resp = await fetch(`${prefix}/image/${stem}/${endpoint}?refresh=false`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
         });
@@ -1111,8 +1310,9 @@ class App {
     this._enqueue(async () => {
       if (this.cur !== stem) { this._removeAnn(pAnn); return; }
       let resp;
+      const prefix = this.gtMode ? '/api/gt' : '/api';
       try {
-        resp = await fetch(`/api/image/${stem}/paint-outer?refresh=false`, {
+        resp = await fetch(`${prefix}/image/${stem}/paint-outer?refresh=false`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
         });
@@ -1134,8 +1334,10 @@ class App {
     this._enqueue(async () => {
       if (this.cur !== stem) { this._removeAnn(pAnn); return; }
       let resp;
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      const eraseEndpoint = this.gtMode ? 'erase' : 'erase-outer';
       try {
-        resp = await fetch(`/api/image/${stem}/erase-outer?refresh=false`, {
+        resp = await fetch(`${prefix}/image/${stem}/${eraseEndpoint}?refresh=false`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
         });
@@ -1147,18 +1349,42 @@ class App {
     }, 'Erase');
   }
 
+  async submitVessel(pts) {
+    if (!this.cur) return;
+    const stem = this.cur;
+    const pAnn = { t: 'add_pending', ...this._ptCentroid(pts) };
+    this.anns.push(pAnn); this.render();
+    this._enqueue(async () => {
+      if (this.cur !== stem) { this._removeAnn(pAnn); return; }
+      let resp;
+      try {
+        resp = await fetch(`/api/gt/image/${stem}/add-vessel?refresh=false`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
+        });
+      } catch (err) { this._removeAnn(pAnn); this.toast(err.message, 'err'); return; }
+      this._removeAnn(pAnn);
+      if (!resp.ok) { this.toast((await resp.json()).detail || 'Error', 'err'); this.render(); return; }
+      const d = await resp.json();
+      this.anns.push({ t: 'add', x: d.x, y: d.y, label: d.added });
+      this.editCount++; this.showEditCount();
+      this._qDirty = true; this.render();
+    }, 'Vessel');
+  }
+
   async submitFascicle(pts) {
     if (!this.cur) return;
     if (pts.length < 3) { this.toast('Draw a larger shape', 'err'); return; }
     this.showBusy(true, 'Saving fascicle...');
     try {
-      const r = await fetch(`/api/image/${this.cur}/set-fascicle`, {
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      const r = await fetch(`${prefix}/image/${this.cur}/set-fascicle`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ points: pts.map(p => [p.x, p.y]) }),
       });
       if (!r.ok) { this.showBusy(false); this.toast((await r.json()).detail || 'Error', 'err'); return; }
       this.showBusy(false);
-      this.toast('Fascicle saved — click Recompute to apply', 'ok');
+      this.toast(this.gtMode ? 'Fascicle saved' : 'Fascicle saved — click Recompute to apply', 'ok');
       this.loadFascicle(this.cur);
       this.setMode('navigate');
     } catch (err) { this.showBusy(false); this.toast(err.message, 'err'); }
@@ -1228,14 +1454,16 @@ class App {
       this._renderStack();
       this._qBarDone();
     }
+    const prefix = this.gtMode ? '/api/gt' : '/api';
     try {
-      const r = await fetch(`/api/image/${this.cur}/undo`, { method: 'POST' });
+      const r = await fetch(`${prefix}/image/${this.cur}/undo`, { method: 'POST' });
       if (!r.ok) { this.toast((await r.json()).detail || 'Nothing to undo', 'info'); return; }
       this.toast('Undo OK', 'ok');
       if (this.editCount > 0) this.editCount--;
       this.anns.pop();
       this.showEditCount();
       this.reloadOverlay();
+      if (this.gtMode) this._loadGtList();  // refresh counts
     } catch (err) { this.toast(err.message, 'err'); }
   }
 
@@ -1326,8 +1554,10 @@ class App {
     if (this._qDirty && this.cur) {
       this._qDirty = false;
       // Regenerate overlay PNG server-side (deferred refresh), then fetch it
-      try { await fetch(`/api/image/${this.cur}/rebuild-overlay`, { method: 'POST' }); } catch {}
+      const prefix = this.gtMode ? '/api/gt' : '/api';
+      try { await fetch(`${prefix}/image/${this.cur}/rebuild-overlay`, { method: 'POST' }); } catch {}
       this.reloadOverlay();
+      if (this.gtMode) this._loadGtList();  // refresh fiber counts
     }
   }
 
@@ -1482,4 +1712,4 @@ class App {
   }
 }
 
-document.addEventListener('DOMContentLoaded', () => new App());
+document.addEventListener('DOMContentLoaded', () => { window._app = new App(); });

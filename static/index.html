@@ -8,39 +8,49 @@
 </head>
 <body>
   <header>
-    <span class="logo">Nerve Validator</span>
+    <span class="logo">⬡ Nerve Validator</span>
     <div class="nav-group">
       <button id="btn-prev" title="Previous (Left arrow)">&#9664;</button>
       <span id="current-stem">--</span>
       <button id="btn-next" title="Next (Right arrow)">&#9654;</button>
     </div>
-    <div class="toolbar">
-      <button class="mode-btn active" data-mode="navigate" title="1 — Pan / zoom">1 Nav</button>
-      <button class="mode-btn" data-mode="delete" title="2 — Click a fiber to delete it">2 Delete</button>
-      <span class="sep-sm"></span>
-      <button class="mode-btn" data-mode="paint-axon" title="3 — Lasso: paint axon inside an existing fiber">3 +Axon</button>
-      <button class="mode-btn" data-mode="paint-outer" title="4 — Lasso: paint myelin sheath (new outer contour, no axon)">4 +Myelin</button>
-      <button class="mode-btn" data-mode="erase-outer" title="5 — Lasso: erase myelin and axon inside the zone">5 Erase</button>
-      <span class="sep-sm"></span>
-      <button class="mode-btn" data-mode="fiber" title="6 — Add a complete new fiber (draw outer, then axon inside)">6 +Fiber</button>
-      <button class="mode-btn" data-mode="fascicle" title="7 — Draw fascicle boundary polygon">7 Fascicle</button>
-      <button class="mode-btn" data-mode="exclude" title="8 — Draw exclusion zone (removed from N-ratio / AVF / MVF denominator)">8 Exclude</button>
-      <button class="mode-btn" data-mode="accept" title="9 — Click a QC-rejected fiber to accept it (toggle) — Recompute to apply">9 Accept</button>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Mode</span>
+      <div class="toolbar">
+        <button class="mode-btn active" data-mode="navigate" title="1 — Pan / zoom"><span class="kb">1</span> ⌖ Nav</button>
+        <button class="mode-btn" data-mode="delete" title="2 — Click a fiber to delete it"><span class="kb">2</span> ✕ Del</button>
+        <span class="sep-sm"></span>
+        <button class="mode-btn" data-mode="paint-axon" title="3 — Lasso: paint axon inside an existing fiber"><span class="kb">3</span> ◉ Axon</button>
+        <button class="mode-btn" data-mode="paint-outer" title="4 — Lasso: paint myelin sheath (extends existing fiber or creates new one)"><span class="kb">4</span> ◎ Myelin</button>
+        <button class="mode-btn" data-mode="erase-outer" title="5 — Lasso: erase myelin and axon inside the zone"><span class="kb">5</span> ⌫ Erase</button>
+        <span class="sep-sm"></span>
+        <button class="mode-btn" data-mode="fiber" title="6 — Add a complete new fiber (draw outer, then axon inside)"><span class="kb">6</span> ⊕ Fiber</button>
+        <button class="mode-btn" data-mode="fascicle" title="7 — Draw fascicle boundary polygon"><span class="kb">7</span> ⬡ Fasc</button>
+        <button class="mode-btn" data-mode="exclude" title="8 — Draw exclusion zone (removed from N-ratio / AVF / MVF denominator)"><span class="kb">8</span> ⊘ Excl</button>
+        <button class="mode-btn" data-mode="accept" title="9 — Click a QC-rejected fiber to accept it (toggle) — Recompute to apply"><span class="kb">9</span> ✔ Accept</button>
+        <button class="mode-btn hidden" data-mode="vessel" title="0 — Lasso: draw blood vessel (GT only)"><span class="kb">0</span> ♥ Vessel</button>
+      </div>
     </div>
     <span class="sep"></span>
-    <div class="toolbar">
-      <button id="btn-undo" class="action" title="Undo last edit (Ctrl+Z)">Undo</button>
-      <button id="btn-recompute" class="action green">Recompute</button>
-      <button id="btn-reset" class="action amber">Reset</button>
-      <button id="btn-recompute-all" class="action blue" title="Recompute all images (background — app stays usable)">Recompute All</button>
-      <span id="batch-progress" class="batch-progress"></span>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Actions</span>
+      <div class="toolbar">
+        <button id="btn-undo" class="action" title="Undo last edit (Ctrl+Z)">↩ Undo</button>
+        <button id="btn-recompute" class="action green">↻ Recompute</button>
+        <button id="btn-reset" class="action amber">⟲ Reset</button>
+        <button id="btn-recompute-all" class="action blue" title="Recompute all images (background — app stays usable)">↻ All</button>
+        <span id="batch-progress" class="batch-progress"></span>
+      </div>
     </div>
     <span class="sep"></span>
-    <div class="toolbar">
-      <button class="view-btn" data-view="numbered" title="Open numbered image">Numbered</button>
-      <button class="view-btn" data-view="dashboard" title="Open dashboard">Dashboard</button>
-      <button class="view-btn" data-view="gratio_map" title="Open G-ratio map">G-ratio</button>
-      <button id="btn-compare" class="action blue" title="Open multi-image comparison">Compare</button>
+    <div class="toolbar-group">
+      <span class="toolbar-label">Views</span>
+      <div class="toolbar">
+        <button class="view-btn" data-view="numbered" title="Open numbered image">⑆ Numbered</button>
+        <button class="view-btn" data-view="dashboard" title="Open dashboard">▦ Dashboard</button>
+        <button class="view-btn" data-view="gratio_map" title="Open G-ratio map">∿ G-ratio</button>
+        <button id="btn-compare" class="action blue" title="Open multi-image comparison">⊡ Compare</button>
+      </div>
     </div>
     <span class="sep"></span>
     <label class="opacity-ctrl" title="Overlay opacity — drag to reveal raw image">
@@ -55,6 +65,11 @@
       <div class="sidebar-head">
         <span class="sidebar-title">Images</span>
         <span id="img-count" class="badge">0</span>
+        <button id="btn-gt-toggle" class="gt-toggle" title="Switch to Ground Truth annotation mode">GT</button>
+      </div>
+      <div id="gt-banner" class="gt-banner hidden">
+        <span>Ground Truth Mode</span>
+        <span id="gt-progress" class="gt-progress"></span>
       </div>
       <ul id="img-list"></ul>
     </aside>
@@ -92,6 +107,12 @@
       <h3 class="mt">Segmentation</h3>
       <table id="tbl-seg"><tbody></tbody></table>
 
+      <div id="gt-validate-panel" class="mt hidden">
+        <h3>Ground Truth</h3>
+        <button id="btn-gt-validate" class="action green" style="width:100%;margin-top:6px" onclick="window._app?.gtValidate()">Mark Validated</button>
+        <div class="sc" style="margin-top:6px">Use mode 6 (+Fiber) to annotate fibers from scratch. Each fiber = outer + inner contour.</div>
+      </div>
+
       <div id="shortcuts" class="mt">
         <h3>Shortcuts</h3>
         <div class="sc">1 Nav · 2 Delete · 3 +Axon · 4 +Myelin · 5 Erase</div>
@@ -112,6 +133,6 @@
   </main>
 
   <div id="toasts"></div>
-  <script src="/static/app.js?v=14"></script>
+  <script src="/static/app.js?v=21"></script>
 </body>
 </html>
