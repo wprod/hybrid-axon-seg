@@ -12,6 +12,9 @@ dependencies = [
     "pillow",
     "openpyxl",
     "torch",
+    "torchvision",
+    "segmentation-models-pytorch",
+    "albumentations",
 ]
 
 [project.optional-dependencies]
