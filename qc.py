@@ -2,9 +2,8 @@
 
 Each rejected fiber gets a short code indicating the *first* failing filter:
   G   = g-ratio out of [MIN_GRATIO, MAX_GRATIO]
+  lgG = large fiber with g-ratio below LARGE_FIBER_MIN_GRATIO
   Ø   = axon diameter < MIN_AXON_DIAM_UM
-  sol = solidity < MIN_SOLIDITY
-  ecc = eccentricity > MAX_AXON_ECCEN
   off = centroid offset > MAX_CENTROID_OFFSET
   brd = touches image border (when EXCLUDE_BORDER=True)
 
@@ -17,14 +16,12 @@ import pandas as pd
 import config
 
 _REASON_LABEL: dict[str, str] = {
+    "axon_out": "out",
     "gratio": "G",
     "axon_diam": "Ø",
-    "solidity": "sol",
-    "eccen": "ecc",
     "offset": "off",
     "border": "brd",
-    "large_lowG": "lgG",  # large fiber + g-ratio < LARGE_FIBER_MIN_GRATIO
-    "shape": "shp",  # fiber round but axon irregular (shape_discordance > threshold)
+    "large_lowG": "lgG",
 }
 
 
@@ -36,21 +33,16 @@ def apply_qc(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     filters: dict[str, pd.Series] = {}
 
+    if "axon_outside_frac" in df.columns:
+        filters["axon_out"] = df["axon_outside_frac"] > config.AXON_OUT_MAX_FRAC
+
     if "gratio" in df.columns:
         filters["gratio"] = ~(
             df["gratio"].notna() & df["gratio"].between(config.MIN_GRATIO, config.MAX_GRATIO)
         )
     filters["axon_diam"] = df["axon_diam"] < config.MIN_AXON_DIAM_UM
-    if "solidity" in df.columns:
-        filters["solidity"] = df["solidity"] < config.MIN_SOLIDITY
-    if "eccentricity" in df.columns:
-        filters["eccen"] = df["eccentricity"] > config.MAX_AXON_ECCEN
-    if "centroid_offset" in df.columns:
-        filters["offset"] = df["centroid_offset"] > config.MAX_CENTROID_OFFSET
     if config.EXCLUDE_BORDER and "image_border_touching" in df.columns:
         filters["border"] = df["image_border_touching"].fillna(False).astype(bool)
-    if "shape_discordance" in df.columns:
-        filters["shape"] = df["shape_discordance"] > config.MAX_SHAPE_DISCORDANCE
     if "fiber_diam" in df.columns and "gratio" in df.columns:
         size_thresh = df["fiber_diam"].quantile(config.LARGE_FIBER_PERCENTILE / 100)
         filters["large_lowG"] = (df["fiber_diam"] >= size_thresh) & (

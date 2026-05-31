@@ -4,17 +4,15 @@ segment.py — Nerve morphometry pipeline (entry point + orchestration).
 
 Pipeline
 --------
-1. Cellpose cyto3      → outer fiber label map   (cached *_cellpose_outer.npy)
-2. Normalized inversion → axon_input image        (cached *_axon_inner.npy)
-   Global Otsu + centroid CC selection → axon blobs
-3. process_fibers      → per-fiber measurements
-4. apply_qc            → pass / reject split
-5. Visualizations      → overlay, numbered, g-ratio map, dashboard
+1. U-Net inference         → outer fiber label map   (cached *_cellpose_outer.npy)
+                           → axon label map           (cached *_axon_inner.npy)
+2. process_fibers          → per-fiber measurements
+3. apply_qc                → pass / reject split
+4. Visualizations          → overlay, numbered, g-ratio map, dashboard
 """
 
 import contextlib
 import sys
-import traceback
 import warnings
 from pathlib import Path
 
@@ -23,9 +21,7 @@ import pandas as pd
 from skimage import io, measure
 
 import config
-from detection import find_axons, run_cellpose_fibers
 from morphometrics import compute_aggregate, process_fibers
-from preprocessing import build_axon_input
 from qc import apply_qc
 from utils import build_fascicle_mask, clean_stem, find_low_qc_cluster_labels, find_satellite_labels
 from visualization import (
@@ -37,9 +33,97 @@ from visualization import (
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Bump this version whenever detection logic or relevant config defaults change.
-# When the stored version in *_axon_version.txt differs, axon caches are rebuilt.
-_AXON_CACHE_VERSION = "2"
+
+def build_axon_assignments(
+    outer_labels: np.ndarray,
+    inner_labels_raw: np.ndarray,
+) -> tuple[dict, dict[int, float], np.ndarray]:
+    """Build axon_assignments dict from cached label arrays, applying shrink + outside detection.
+
+    Multi-core fibers (one outer label with N≥2 disconnected axon blobs) are split
+    via Voronoi partition: each axon blob inherits the fiber pixels closest to it.
+    The returned outer_labels reflects those splits (virtual labels appended after max).
+
+    Returns
+    -------
+    axon_assignments   : fiber_label → (r0, c0, crop_bool)  — shrunk axon masks
+    axon_outside_frac  : fiber_label → fraction of axon pixels outside fiber
+    outer_labels       : updated label array (may contain new virtual labels for splits)
+    """
+    from scipy.ndimage import distance_transform_edt
+    from scipy.ndimage import label as nd_label
+
+    outer_labels = outer_labels.copy()
+    fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer_labels)}
+    axon_assignments: dict = {}
+    axon_outside_frac: dict[int, float] = {}
+    next_label = int(outer_labels.max()) + 1
+
+    for lbl in np.unique(inner_labels_raw):
+        if lbl == 0:
+            continue
+        bbox = fiber_bboxes.get(int(lbl))
+        if bbox is None:
+            continue
+        minr, minc, maxr, maxc = bbox
+        axon_crop = inner_labels_raw[minr:maxr, minc:maxc] == lbl
+        fiber_crop = outer_labels[minr:maxr, minc:maxc] == lbl
+
+        if axon_crop.sum() < config.MIN_AXON_SIZE:
+            continue
+
+        # Detect connected components in the axon mask
+        labeled_blobs, n_blobs = nd_label(axon_crop)
+        components = [
+            labeled_blobs == c
+            for c in range(1, n_blobs + 1)
+            if (labeled_blobs == c).sum() >= config.MIN_AXON_SIZE
+        ]
+
+        if not components:
+            continue
+
+        if len(components) == 1:
+            # ── Normal single-axon path ──────────────────────────────────
+            crop = components[0]
+            outside_px = int((crop & ~fiber_crop).sum())
+            axon_outside_frac[int(lbl)] = outside_px / int(crop.sum())
+            shrink_px = int(getattr(config, "AXON_SHRINK_PX", 0))
+            if shrink_px > 0:
+                dist = distance_transform_edt(crop)
+                shrunk = dist > shrink_px
+                if shrunk.any():
+                    crop = shrunk
+            axon_assignments[int(lbl)] = (minr, minc, crop)
+
+        else:
+            # ── Multi-core: Voronoi partition of fiber pixels ────────────
+            # Each fiber pixel goes to the nearest axon blob (by Euclidean distance)
+            dists = np.stack([distance_transform_edt(~c) for c in components])
+            nearest = np.argmin(dists, axis=0)  # 0-indexed
+
+            new_labels = [int(lbl)] + [next_label + i for i in range(len(components) - 1)]
+            next_label += len(components) - 1
+
+            # Repartition outer_labels in this crop
+            crop_view = outer_labels[minr:maxr, minc:maxc]
+            for i, new_lbl in enumerate(new_labels):
+                crop_view[fiber_crop & (nearest == i)] = new_lbl
+
+            # Register each axon with its virtual fiber label
+            for comp, new_lbl in zip(components, new_labels):
+                outside_px = int((comp & ~fiber_crop).sum())
+                axon_outside_frac[new_lbl] = outside_px / max(int(comp.sum()), 1)
+                shrink_px = int(getattr(config, "AXON_SHRINK_PX", 0))
+                crop = comp
+                if shrink_px > 0:
+                    dist = distance_transform_edt(crop)
+                    shrunk = dist > shrink_px
+                    if shrunk.any():
+                        crop = shrunk
+                axon_assignments[new_lbl] = (minr, minc, crop)
+
+    return axon_assignments, axon_outside_frac, outer_labels
 
 
 def _remove_labels(outer_labels: np.ndarray, labels_to_remove: set) -> np.ndarray:
@@ -93,6 +177,7 @@ def finalize_image(
     fascicle_mask: np.ndarray | None = None,
     excl_mask: np.ndarray | None = None,
     qc_overrides: set[int] | None = None,
+    axon_outside_frac: dict[int, float] | None = None,
 ) -> tuple[str, int, dict]:
     """Shared pipeline tail: morphometrics → QC → aggregate → CSV → visualizations.
 
@@ -109,6 +194,10 @@ def finalize_image(
     n_matched = len(pairs)
     print(f"       → {len(df_all)} axons measured")
 
+    # Inject axon-outside-fiber fraction so QC can filter on it
+    if axon_outside_frac:
+        df_all["axon_outside_frac"] = df_all["_fiber_label"].map(axon_outside_frac).fillna(0.0)
+
     df_pass, df_rej = apply_qc(df_all)
     # Re-admit manually accepted fibers
     if qc_overrides:
@@ -120,10 +209,10 @@ def finalize_image(
     override_note = f" ({n_overridden} manually accepted)" if n_overridden else ""
     print(f"       → QC: {len(df_pass)} pass / {len(df_rej)} reject{override_note}")
 
-    # Remove low-QC clusters — skipped when fascicle mask constrains Cellpose
+    # Remove low-QC clusters — skipped when fascicle mask constrains U-Net
     if not has_fascicle:
         bad_cluster_labels = find_low_qc_cluster_labels(
-            outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.CP_DIAM_UM
+            outer_labels, df_pass, df_rej, config.PIXEL_SIZE, config.FIBER_DIAM_UM
         )
         if bad_cluster_labels:
             outer_labels = _remove_labels(outer_labels, bad_cluster_labels)
@@ -138,7 +227,7 @@ def finalize_image(
 
     # ── Fascicle mask ────────────────────────────────────────────────────
     if fascicle_mask is None:
-        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.FIBER_DIAM_UM)
     np.save(str(out_dir / f"{stem}_fascicle_mask.npy"), fascicle_mask)
 
     # ── Aggregate stats ──────────────────────────────────────────────────
@@ -207,58 +296,24 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
     if img.ndim == 3 and img.shape[2] == 4:
         img = img[:, :, :3]
 
-    # ── Step 1: Cellpose — outer fibers ──────────────────────────────────
+    # ── Step 1: U-Net — outer fibers + axons ────────────────────────────
     cache_outer = out_dir / f"{stem}_cellpose_outer.npy"
-    old_cache = out_dir / f"{stem}_cellpose.npy"
-    if not cache_outer.exists() and old_cache.exists():
-        cache_outer = old_cache  # backwards-compat
+    cache_axon = out_dir / f"{stem}_axon_inner.npy"
+    cache_multicore = out_dir / f"{stem}_multicore_labels.npy"
 
     fascicle_pre = out_dir / f"{stem}_fascicle_mask_edited.npy"
     has_fascicle = fascicle_pre.exists()
 
-    # If fascicle mask is newer than Cellpose cache → invalidate both caches
-    # so Cellpose re-runs restricted to the fascicle boundary
-    if (
-        has_fascicle
-        and cache_outer.exists()
-        and fascicle_pre.stat().st_mtime > cache_outer.stat().st_mtime
-    ):
-        print("       fascicle mask updated — clearing Cellpose & axon caches")
-        cache_outer.unlink()
-        for _stale in (
-            out_dir / f"{stem}_axon_inner.npy",
-            out_dir / f"{stem}_axon_input.png",
-        ):
-            if _stale.exists():
-                _stale.unlink()
-
     if cache_outer.exists():
-        print("  [1/2] Cellpose (fibers) — loading from cache…")
+        print("  [1/2] U-Net (fibers) — loading from cache…")
         outer_labels = np.load(str(cache_outer))
     else:
-        print("  [1/2] Cellpose (fibers)…")
-        img_for_cellpose = img
-        if has_fascicle:
-            fm = np.load(str(fascicle_pre))
-            if fm.shape == img.shape[:2]:
-                print("       restricting to manual fascicle mask…")
-                img_for_cellpose = img.copy()
-                bg = (
-                    255
-                    if img.dtype == np.uint8
-                    else (np.iinfo(img.dtype).max if np.issubdtype(img.dtype, np.integer) else 1.0)
-                )
-                if img_for_cellpose.ndim == 3:
-                    img_for_cellpose[~fm] = bg
-                else:
-                    img_for_cellpose[~fm] = bg
-            else:
-                print(f"       ⚠ fascicle mask shape {fm.shape} ≠ image {img.shape[:2]}, ignored")
-        outer_labels = run_cellpose_fibers(img_for_cellpose)
-        np.save(str(out_dir / f"{stem}_cellpose_outer.npy"), outer_labels)
+        raise FileNotFoundError(
+            f"U-Net results not found for '{stem}'. Run U-Net inference first to generate "
+            f"{cache_outer.name} and {cache_axon.name}."
+        )
 
     # Erode each fiber mask: remove pixels within OUTER_ERODE_PX of any border
-    # (internal between cells OR external). Vectorized via distance transform.
     if config.OUTER_ERODE_PX > 0:
         from scipy.ndimage import distance_transform_edt, maximum_filter, minimum_filter
 
@@ -268,114 +323,38 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         dist = distance_transform_edt(~border)
         outer_labels = (outer_labels * (dist > config.OUTER_ERODE_PX)).astype(outer_labels.dtype)
 
-    # Remove satellite fibers — skipped when fascicle mask constrains Cellpose
+    # Remove satellite fibers — skipped when fascicle mask constrains U-Net
     if not has_fascicle:
-        satellites = find_satellite_labels(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        satellites = find_satellite_labels(outer_labels, config.PIXEL_SIZE, config.FIBER_DIAM_UM)
         outer_labels = _remove_labels(outer_labels, satellites)
 
     n_outer = int(outer_labels.max())
     print(f"       → {n_outer} fibers")
 
-    # ── Step 2: Axon detection ────────────────────────────────────────────
-    cache_axon = out_dir / f"{stem}_axon_inner.npy"
-    cache_multicore = out_dir / f"{stem}_multicore_labels.npy"
-    version_file = out_dir / f"{stem}_axon_version.txt"
-
-    # Invalidate axon cache when detection logic has changed
+    # ── Step 2: Load axon labels ──────────────────────────────────────────
     if cache_axon.exists():
-        stored_ver = version_file.read_text().strip() if version_file.exists() else ""
-        if stored_ver != _AXON_CACHE_VERSION:
-            print("       axon detection version changed — clearing axon cache")
-            cache_axon.unlink()
-            for _stale in (out_dir / f"{stem}_axon_input.png", cache_multicore):
-                if _stale.exists():
-                    _stale.unlink()
-
-    if cache_axon.exists():
-        print("  [2/2] Axon detection — loading from cache…")
+        print("  [2/2] Axon labels — loading from cache…")
         inner_labels_raw = np.load(str(cache_axon))
-        fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer_labels)}
-        axon_assignments = {}
-        for lbl in np.unique(inner_labels_raw):
-            if lbl == 0:
-                continue
-            bbox = fiber_bboxes.get(int(lbl))
-            if bbox is None:
-                continue
-            minr, minc, maxr, maxc = bbox
-            axon_assignments[int(lbl)] = (minr, minc, inner_labels_raw[minr:maxr, minc:maxc] == lbl)
-        multicore_labels = (
-            set(np.load(str(cache_multicore)).tolist()) if cache_multicore.exists() else set()
-        )
     else:
-        print("  [2/2] Building axon input image…")
-        axon_input = build_axon_input(img, outer_labels)
-        io.imsave(str(out_dir / f"{stem}_axon_input.png"), axon_input, check_contrast=False)
-
-        print("       detecting axons (global Otsu)…")
-        axon_assignments, multicore_labels = find_axons(axon_input, outer_labels)
-
+        print("  [2/2] No axon cache found — using empty axon map")
         inner_labels_raw = np.zeros(outer_labels.shape, dtype=outer_labels.dtype)
-        for fiber_label, (r0, c0, crop) in axon_assignments.items():
-            inner_labels_raw[r0 : r0 + crop.shape[0], c0 : c0 + crop.shape[1]][crop] = fiber_label
         np.save(str(cache_axon), inner_labels_raw)
-        np.save(str(cache_multicore), np.array(sorted(multicore_labels), dtype=np.int32))
-        version_file.write_text(_AXON_CACHE_VERSION)
 
-    # ── Step 2b: Hard myelin-gap enforcement ─────────────────────────────
-    # Guarantee that no axon pixel is within the mandatory margin of its fiber
-    # boundary.  Works on the final assembled inner_labels_raw using the exact
-    # outer_labels that will be used for visualisation — so no mismatch is
-    # possible.  Catches any stray pixels that slip through per-crop processing
-    # (fill_holes edge cases, sub-pixel crop-boundary artefacts, etc.).
-    if config.AXON_MIN_MYELIN_FRAC > 0 or config.AXON_MIN_MYELIN_PX > 0:
-        from scipy.ndimage import distance_transform_edt as _edt
+    if not cache_multicore.exists():
+        np.save(str(cache_multicore), np.array([], dtype=np.int32))
 
-        inner_labels_raw = np.zeros(outer_labels.shape, dtype=outer_labels.dtype)
-        for fiber_label, (r0, c0, crop) in axon_assignments.items():
-            inner_labels_raw[r0 : r0 + crop.shape[0], c0 : c0 + crop.shape[1]][crop] = fiber_label
-        # Precompute bboxes once — avoids repeated full-image scans inside the loop
-        _bboxes = {p.label: (p.bbox, p.area) for p in measure.regionprops(outer_labels)}
-        for lbl in np.unique(inner_labels_raw):
-            if lbl == 0:
-                continue
-            info = _bboxes.get(int(lbl))
-            if info is None:
-                continue
-            (minr, minc, maxr, maxc), area = info
-            fiber_crop = outer_labels[minr:maxr, minc:maxc] == lbl
-            fiber_radius_px = float(np.sqrt(area / np.pi))
-            min_px = max(
-                float(config.AXON_MIN_MYELIN_PX), config.AXON_MIN_MYELIN_FRAC * fiber_radius_px
-            )
-            dist_crop = _edt(fiber_crop)  # EDT on small crop, not full image
-            axon_crop = inner_labels_raw[minr:maxr, minc:maxc] == lbl
-            inner_labels_raw[minr:maxr, minc:maxc][axon_crop & (dist_crop <= min_px)] = 0
-        # Rebuild axon_assignments from the cleaned inner_labels_raw
-        fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer_labels)}
-        axon_assignments = {}
-        for lbl in np.unique(inner_labels_raw):
-            if lbl == 0:
-                continue
-            bbox = fiber_bboxes.get(int(lbl))
-            if bbox is None:
-                continue
-            minr, minc, maxr, maxc = bbox
-            crop = inner_labels_raw[minr:maxr, minc:maxc] == lbl
-            if crop.sum() >= config.MIN_AXON_SIZE:
-                axon_assignments[int(lbl)] = (minr, minc, crop)
-        np.save(str(cache_axon), inner_labels_raw)
-        version_file.write_text(_AXON_CACHE_VERSION)
+    multicore_labels: set = set()
+
+    # Reconstruct axon_assignments (with shrink + outside detection)
+    axon_assignments, axon_outside_frac, outer_labels = build_axon_assignments(outer_labels, inner_labels_raw)
 
     # ── Steps 3–5: shared pipeline (morphometrics → QC → viz) ──────────
-    # Load fascicle mask (manual if available, else auto-computed inside finalize)
     fascicle_mask = None
     if has_fascicle:
         fm = np.load(str(fascicle_pre))
         if fm.shape == outer_labels.shape:
             fascicle_mask = fm
 
-    # Load exclusion zones (artefacts / tears drawn in the web UI)
     excl_path = out_dir / f"{stem}_exclusion_mask.npy"
     excl_mask = np.load(str(excl_path)) if excl_path.exists() else None
     if excl_mask is not None and excl_mask.shape != outer_labels.shape:
@@ -393,6 +372,7 @@ def process_image(img_path: Path, group: str = "", timepoint: str = "") -> tuple
         has_fascicle=has_fascicle,
         fascicle_mask=fascicle_mask,
         excl_mask=excl_mask,
+        axon_outside_frac=axon_outside_frac,
     )
 
     print(f"  ✓ Done — {out_dir}")
@@ -444,14 +424,7 @@ def main() -> None:
         stem = clean_stem(p)
         agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
         fascicle_path = config.OUTPUT_DIR / stem / f"{stem}_fascicle_mask_edited.npy"
-        # Skip only if aggregate is newer than the fascicle mask AND axon cache is current
-        ver_path = config.OUTPUT_DIR / stem / f"{stem}_axon_version.txt"
-        ver_ok = ver_path.exists() and ver_path.read_text().strip() == _AXON_CACHE_VERSION
-        if (
-            agg_path.exists()
-            and ver_ok
-            and agg_path.stat().st_mtime >= fascicle_path.stat().st_mtime
-        ):
+        if agg_path.exists() and agg_path.stat().st_mtime >= fascicle_path.stat().st_mtime:
             print(f"  ↷ {stem}  (already processed, skipping)")
             agg = pd.read_csv(agg_path).iloc[0].to_dict()
             results.append({"image": stem, **agg})
@@ -461,7 +434,6 @@ def main() -> None:
             results.append({"image": stem, "n_axons": n, **agg})
         except Exception as e:
             print(f"  ✗ {p.name}: {e}")
-            traceback.print_exc()
 
     if results:
         summary = pd.DataFrame(results)

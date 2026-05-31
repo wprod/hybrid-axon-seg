@@ -106,7 +106,8 @@ def process_fibers(
 
     df = pd.DataFrame(rows)
     n_ok = len(rows)
-    n_fail = int(outer_labels.max()) - n_ok
+    n_total = len(fiber_rprops)
+    n_fail = n_total - n_ok
     print(f"       -> {n_ok} fibers with axon, {n_fail} without (shown in red)")
 
     return inner_labels, pairs, df, index_image

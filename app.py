@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
@@ -25,16 +25,31 @@ from pydantic import BaseModel
 from skimage import io, measure
 
 import config
-from segment import _remove_labels, finalize_image
+from segment import _remove_labels, build_axon_assignments, finalize_image
 from utils import build_fascicle_mask, clean_stem, find_satellite_labels
 
 _AUTH_USER = "axon"
 _AUTH_PASS = os.environ.get("APP_PASSWORD") or secrets.token_urlsafe(10)
 
-_security = HTTPBasic()
+_security = HTTPBasic(auto_error=False)
 
 
-def _check_auth(creds: HTTPBasicCredentials = Depends(_security)):  # noqa: B008
+def _check_auth(
+    request: Request,
+    creds: HTTPBasicCredentials | None = Depends(_security),  # noqa: B008
+):
+    # Local access (127.0.0.1 or ::1) never requires a password
+    client_ip = request.client.host if request.client else ""
+    if client_ip in ("127.0.0.1", "::1"):
+        return
+
+    # Remote access (via Cloudflare or otherwise) requires Basic Auth
+    if creds is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     ok_user = secrets.compare_digest(creds.username.encode(), _AUTH_USER.encode())
     ok_pass = secrets.compare_digest(creds.password.encode(), _AUTH_PASS.encode())
     if not (ok_user and ok_pass):
@@ -55,6 +70,27 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 _stem_locks: dict[str, threading.Lock] = {}
 
+# ── Per-stem metadata cache ──────────────────────────────────────────────────
+# Avoids re-reading aggregate CSVs on every /api/images call.
+# Each entry holds (group, timepoint, n_axons).  Built lazily; individual
+# entries invalidated after recompute (which overwrites the aggregate CSV).
+_meta_cache: dict[str, tuple[str, str, int]] = {}
+
+# Stem → parent folder name, built once from INPUT_DIR at first use.
+_stem_to_folder: dict[str, str] | None = None
+
+
+def _build_stem_to_folder() -> dict[str, str]:
+    """Scan INPUT_DIR once and return stem → subfolder name."""
+    import re
+    mapping: dict[str, str] = {}
+    if not config.INPUT_DIR.exists():
+        return mapping
+    for p in config.INPUT_DIR.rglob("*"):
+        if p.suffix.lower() in {".tif", ".tiff", ".png"} and p.parent != config.INPUT_DIR:
+            mapping[clean_stem(p)] = p.parent.name
+    return mapping
+
 # ── In-memory presence tracking ─────────────────────────────────────────────
 # stem → {client_id: last_seen_unix_ts}  (ephemeral, lost on server restart)
 _presence: dict[str, dict[str, float]] = {}
@@ -72,7 +108,7 @@ def _lock(stem: str) -> threading.Lock:
 
 
 def _stems() -> list[str]:
-    """Processed stems only (have Cellpose cache)."""
+    """Processed stems only (have U-Net cache)."""
     if not config.OUTPUT_DIR.exists():
         return []
     return sorted(
@@ -110,7 +146,7 @@ def _find_raw(stem: str) -> Path | None:
 
 
 def _load_outer_base(stem: str) -> np.ndarray:
-    """Load outer labels from Cellpose cache + erosion + satellite removal."""
+    """Load outer labels from U-Net cache + erosion + satellite removal."""
     d = _out(stem)
     cache = d / f"{stem}_cellpose_outer.npy"
     old = d / f"{stem}_cellpose.npy"
@@ -129,19 +165,19 @@ def _load_outer_base(stem: str) -> np.ndarray:
 
     fascicle_edited = d / f"{stem}_fascicle_mask_edited.npy"
     if not fascicle_edited.exists():
-        satellites = find_satellite_labels(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        satellites = find_satellite_labels(outer, config.PIXEL_SIZE, config.FIBER_DIAM_UM)
         outer = _remove_labels(outer, satellites)
 
     return outer
 
 
 def _load_outer(stem: str) -> np.ndarray:
-    """Load outer labels — gt > edited > cellpose base.
+    """Load outer labels — gt > edited > U-Net base.
 
     Returns the most complete label map available:
     - ``_outer_gt.npy``     ground truth (clinician-validated, includes additions)
     - ``_outer_edited.npy`` corrected prediction (deletions/modifications only)
-    - Cellpose cache        raw model output + erosion + satellite removal
+    - U-Net cache           raw model output + erosion + satellite removal
     """
     d = _out(stem)
     gt = d / f"{stem}_outer_gt.npy"
@@ -175,7 +211,7 @@ def _backup_outer(stem: str) -> None:
     - ``_outer_edited.npy`` — corrected prediction (no manual additions)
     - ``_outer_gt.npy``     — ground truth (includes manual additions)
 
-    On first call, both are bootstrapped from the Cellpose base.  If only
+    On first call, both are bootstrapped from the U-Net base.  If only
     ``_outer_edited.npy`` exists (legacy data), ``_outer_gt.npy`` is copied
     from it so existing edits (including any legacy additions) are preserved.
     """
@@ -225,7 +261,7 @@ def _load_fascicle_mask(stem: str, outer: np.ndarray) -> np.ndarray:
     edited = _out(stem) / f"{stem}_fascicle_mask_edited.npy"
     if edited.exists():
         return np.load(str(edited))
-    return build_fascicle_mask(outer, config.PIXEL_SIZE, config.CP_DIAM_UM)
+    return build_fascicle_mask(outer, config.PIXEL_SIZE, config.FIBER_DIAM_UM)
 
 
 def _load_exclusion_mask(stem: str, shape: tuple) -> np.ndarray | None:
@@ -328,18 +364,11 @@ def list_images():
         )
         n_edits = 0
         n_axons = 0
+        group, timepoint = "", ""
         if processed and d.exists():
             edits = _load_edits(stem)
             n_edits = len(edits.get("deleted", [])) + len(edits.get("added", []))
-            agg_path = d / f"{stem}_aggregate.csv"
-            if agg_path.exists():
-                agg = pd.read_csv(agg_path)
-                if "n_axons" in agg.columns:
-                    n_axons = int(agg["n_axons"].iloc[0])
-                else:
-                    morph = d / f"{stem}_morphometrics.csv"
-                    if morph.exists():
-                        n_axons = len(pd.read_csv(morph))
+            group, timepoint, n_axons = _read_stem_meta(stem)
         # Needs recompute: edits pending since last morphometrics run
         edits_path = d / f"{stem}_edits.json"
         morph_path = d / f"{stem}_morphometrics.csv"
@@ -357,6 +386,8 @@ def list_images():
                 "n_edits": n_edits,
                 "n_axons": n_axons,
                 "needs_resegment": needs_resegment,
+                "group": group,
+                "timepoint": timepoint,
             }
         )
     return images
@@ -711,7 +742,7 @@ def set_fascicle(stem: str, req: FascicleReq):
         d = config.OUTPUT_DIR / stem
         d.mkdir(parents=True, exist_ok=True)
 
-        # Resolve image shape: Cellpose cache if available, else raw image
+        # Resolve image shape: U-Net cache if available, else raw image
         outer_cache = d / f"{stem}_cellpose_outer.npy"
         old_cache = d / f"{stem}_cellpose.npy"
         if outer_cache.exists():
@@ -916,28 +947,66 @@ def clear_exclusion(stem: str):
 # ── Recompute ────────────────────────────────────────────────────────────────
 
 
-def _read_group_timepoint(stem: str) -> tuple[str, str]:
-    """Recover group/timepoint from existing aggregate CSV, or derive from INPUT_DIR folder."""
-    agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
-    if agg_path.exists():
-        row = pd.read_csv(agg_path).iloc[0]
-        g = str(row.get("group", "")) if "group" in row else ""
-        t = str(row.get("timepoint", "")) if "timepoint" in row else ""
-        if g or t:
-            return g, t
-    # Derive from INPUT_DIR folder structure (same logic as segment.py _parse_folder)
+def _read_stem_meta(stem: str) -> tuple[str, str, int]:
+    """Return (group, timepoint, n_axons) for a stem — cached after first lookup."""
+    global _stem_to_folder
+    if stem in _meta_cache:
+        return _meta_cache[stem]
+
     import re
 
-    for p in config.INPUT_DIR.rglob("*"):
-        if p.suffix.lower() in {".tif", ".tiff", ".png"} and clean_stem(p) == stem:
-            parent = p.parent
-            if parent != config.INPUT_DIR:
-                name = parent.name
-                m = re.search(r"(\d+w)\s*$", name.strip())
-                if m:
-                    return name.strip()[: m.start()].strip(), m.group(1)
-            break
-    return "", ""
+    g, t, n_axons = "", "", 0
+
+    # 1. Try aggregate CSV — single read gets group + timepoint + n_axons
+    agg_path = config.OUTPUT_DIR / stem / f"{stem}_aggregate.csv"
+    if agg_path.exists():
+        try:
+            row = pd.read_csv(agg_path).iloc[0]
+            g = str(row.get("group", ""))
+            t = str(row.get("timepoint", ""))
+            if g == "nan":
+                g = ""
+            if t == "nan":
+                t = ""
+            if "n_axons" in row:
+                n_axons = int(row["n_axons"]) if pd.notna(row["n_axons"]) else 0
+        except Exception:
+            pass
+
+    # 2. n_axons fallback: count rows in morphometrics CSV
+    if n_axons == 0:
+        morph = config.OUTPUT_DIR / stem / f"{stem}_morphometrics.csv"
+        if morph.exists():
+            try:
+                n_axons = sum(1 for _ in open(morph)) - 1  # fast line count, no pandas
+            except Exception:
+                pass
+
+    # 3. group/timepoint fallback: INPUT_DIR folder structure
+    if not g and not t:
+        if _stem_to_folder is None:
+            _stem_to_folder = _build_stem_to_folder()
+        folder = _stem_to_folder.get(stem, "")
+        if folder:
+            m = re.search(r"(\d+w)\s*$", folder.strip())
+            if m:
+                g = folder.strip()[: m.start()].strip()
+                t = m.group(1)
+
+    result = (g, t, n_axons)
+    _meta_cache[stem] = result
+    return result
+
+
+def _read_group_timepoint(stem: str) -> tuple[str, str]:
+    """Compatibility wrapper — returns (group, timepoint) only."""
+    g, t, _ = _read_stem_meta(stem)
+    return g, t
+
+
+def _invalidate_group_cache(stem: str) -> None:
+    """Evict one stem from the cache (call after recompute writes a new aggregate CSV)."""
+    _meta_cache.pop(stem, None)
 
 
 def _prepare_recompute(stem: str):
@@ -967,17 +1036,8 @@ def _prepare_recompute(stem: str):
             outer = _remove_labels(outer, outside)
             inner = _remove_labels(inner, outside)
 
-    # Reconstruct axon_assignments from inner_labels
-    fiber_bboxes = {p.label: p.bbox for p in measure.regionprops(outer)}
-    axon_assignments = {}
-    for lbl in np.unique(inner):
-        if lbl == 0:
-            continue
-        bbox = fiber_bboxes.get(int(lbl))
-        if bbox is None:
-            continue
-        minr, minc, maxr, maxc = bbox
-        axon_assignments[int(lbl)] = (minr, minc, inner[minr:maxr, minc:maxc] == lbl)
+    # Reconstruct axon_assignments (with shrink + outside detection)
+    axon_assignments, axon_outside_frac, outer = build_axon_assignments(outer, inner)
 
     fascicle_mask = _load_fascicle_mask(stem, outer)
     excl_mask = _load_exclusion_mask(stem, fascicle_mask.shape)
@@ -989,16 +1049,17 @@ def _prepare_recompute(stem: str):
     if img.ndim == 3 and img.shape[2] == 4:
         img = img[:, :, :3]
 
-    return img, outer, axon_assignments, multicore, has_fascicle, fascicle_mask, excl_mask
+    return img, outer, axon_assignments, axon_outside_frac, multicore, has_fascicle, fascicle_mask, excl_mask
 
 
 @app.post("/api/image/{stem}/recompute")
 def recompute(stem: str):
     with _lock(stem):
         d = _out(stem)
-        img, outer, axon_assignments, multicore, has_fascicle, fascicle_mask, excl_mask = (
+        img, outer, axon_assignments, axon_outside_frac, multicore, has_fascicle, fascicle_mask, excl_mask = (
             _prepare_recompute(stem)
         )
+        _invalidate_group_cache(stem)
         group, timepoint = _read_group_timepoint(stem)
 
         _, n, agg = finalize_image(
@@ -1014,6 +1075,7 @@ def recompute(stem: str):
             fascicle_mask=fascicle_mask,
             excl_mask=excl_mask,
             qc_overrides=_load_qc_overrides(stem),
+            axon_outside_frac=axon_outside_frac,
         )
 
         _save_edits(stem, {"deleted": [], "added": []})
@@ -1126,9 +1188,10 @@ def _batch_recompute_worker(stems: list[str]):
         try:
             with _lock(stem):
                 d = _out(stem)
-                img, outer, axon_assignments, multicore, has_fascicle, fascicle_mask, excl_mask = (
+                img, outer, axon_assignments, axon_outside_frac, multicore, has_fascicle, fascicle_mask, excl_mask = (
                     _prepare_recompute(stem)
                 )
+                _invalidate_group_cache(stem)
                 group, timepoint = _read_group_timepoint(stem)
                 _, n, agg = finalize_image(
                     img,
@@ -1143,6 +1206,7 @@ def _batch_recompute_worker(stems: list[str]):
                     fascicle_mask=fascicle_mask,
                     excl_mask=excl_mask,
                     qc_overrides=_load_qc_overrides(stem),
+                    axon_outside_frac=axon_outside_frac,
                 )
                 _save_edits(stem, {"deleted": [], "added": []})
                 _clear_undo(stem)
@@ -1273,8 +1337,11 @@ def _gt_load_vessels(stem: str) -> np.ndarray:
 def _gt_load_outer(stem: str) -> np.ndarray:
     p = GT_MASKS / f"{stem}_outer_gt.npy"
     if p.exists():
-        return np.load(str(p))
-    # Create empty array matching image shape
+        try:
+            return np.load(str(p))
+        except (EOFError, ValueError, OSError) as e:
+            print(f"[gt] {p.name} corrompu ({e}) — réinitialisé")
+            p.unlink()  # remove corrupted file so it gets recreated cleanly
     raw = _gt_find_raw(stem)
     if raw is None:
         raise HTTPException(404, f"GT image not found: {stem}")
@@ -1285,7 +1352,11 @@ def _gt_load_outer(stem: str) -> np.ndarray:
 def _gt_load_inner(stem: str) -> np.ndarray:
     p = GT_MASKS / f"{stem}_axon_gt.npy"
     if p.exists():
-        return np.load(str(p))
+        try:
+            return np.load(str(p))
+        except (EOFError, ValueError, OSError) as e:
+            print(f"[gt] {p.name} corrompu ({e}) — réinitialisé")
+            p.unlink()
     raw = _gt_find_raw(stem)
     if raw is None:
         raise HTTPException(404, f"GT image not found: {stem}")
@@ -1322,7 +1393,7 @@ def _gt_overlay(stem: str) -> bool:
     inner = _gt_load_inner(stem)
 
     rgb = to_rgb_uint8(img)
-    ov = (rgb.astype(np.float32) * 0.4).astype(np.uint8)
+    ov = rgb.copy()
 
     def blend(mask, color, alpha=0.55):
         c = np.array(color, dtype=np.float32)
@@ -1358,18 +1429,31 @@ def _gt_save_status(status: dict) -> None:
 @app.get("/api/gt/images")
 def gt_list_images():
     stems = _gt_stems()
-    status = _gt_load_status()
+    try:
+        status = _gt_load_status()
+    except Exception:
+        status = {}
     images = []
     for stem in stems:
-        outer_path = GT_MASKS / f"{stem}_outer_gt.npy"
         n_fibers = 0
-        if outer_path.exists():
-            outer = np.load(str(outer_path))
-            n_fibers = len(np.unique(outer)) - 1  # exclude 0
+        try:
+            outer_path = GT_MASKS / f"{stem}_outer_gt.npy"
+            if outer_path.exists():
+                outer = np.load(str(outer_path))
+                n_fibers = len(np.unique(outer)) - 1  # exclude background 0
+        except Exception as e:
+            print(f"[gt_list_images] {stem}: {e}")
+        try:
+            group, timepoint = _read_group_timepoint(stem)
+        except Exception as e:
+            print(f"[gt_list_images] group {stem}: {e}")
+            group, timepoint = "", ""
         images.append({
             "stem": stem,
             "n_fibers": n_fibers,
             "status": status.get(stem, "pending"),
+            "group": group,
+            "timepoint": timepoint,
         })
     return images
 
@@ -1406,12 +1490,19 @@ def gt_get_info(stem: str):
     inner = _gt_load_inner(stem)
     vessels = _gt_load_vessels(stem)
     fibers = []
+    px = config.PIXEL_SIZE
     for p in measure.regionprops(outer):
         if p.label == 0:
             continue
         cy, cx = int(p.centroid[0]), int(p.centroid[1])
         has_axon = bool((inner == p.label).any())
-        fibers.append({"label": int(p.label), "x": cx, "y": cy, "has_axon": has_axon})
+        gratio = None
+        if has_axon:
+            fiber_area = p.area * px * px
+            axon_area = int((inner == p.label).sum()) * px * px
+            gratio = round(float(np.sqrt(axon_area / fiber_area)), 3)
+        fibers.append({"label": int(p.label), "x": cx, "y": cy,
+                        "has_axon": has_axon, "gratio": gratio})
     n_vessels = len(np.unique(vessels)) - 1  # exclude 0
     raw_path = _gt_find_raw(stem)
     shape = list(outer.shape) if outer.size > 0 else [0, 0]
@@ -1609,6 +1700,10 @@ def gt_erase(stem: str, poly: PolyReq, refresh: bool = True):
         if len(rr) == 0:
             raise HTTPException(400, "Polygon is empty or out of bounds")
 
+        n_fibers_hit = len(np.unique(outer[rr, cc])) - 1  # exclude 0
+        if n_fibers_hit > 20:
+            raise HTTPException(400, f"Erase would delete {n_fibers_hit} fibers — max 20 per operation")
+
         outer[rr, cc] = 0
         inner[rr, cc] = 0
         _gt_save(stem, outer, inner)
@@ -1756,6 +1851,7 @@ def gt_clear_fascicle(stem: str):
         return {"status": "ok"}
 
 
+
 @app.get("/api/comparison")
 def get_comparison():
     for name in ("comparison_dashboard.png", "comparison.png"):
@@ -1791,4 +1887,12 @@ if __name__ == "__main__":
     print("\n  Nerve Segmentation Validator")
     print("  http://127.0.0.1:8000")
     print(f"\n  Login  →  user: {_AUTH_USER}  |  password: {_AUTH_PASS}\n")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    _reload = os.environ.get("RELOAD", "").lower() in ("1", "true", "yes")
+    os.environ.setdefault("APP_PASSWORD", _AUTH_PASS)
+    uvicorn.run(
+        "app:app",
+        host="127.0.0.1",
+        port=8000,
+        reload=_reload,
+        **({"reload_dirs": ["."], "reload_includes": ["*.py"]} if _reload else {}),
+    )
