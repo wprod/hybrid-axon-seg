@@ -1,505 +1,411 @@
-# hybrid-axon-seg for Marie 🩵
+# hybrid-axon-seg
 
-**Automated nerve morphometry pipeline.**
-
-Detects myelinated axons in cross-sectional nerve images, segments the axon
-and myelin compartments, and computes g-ratio, myelin thickness, axon/fiber
-diameters, axon volume fraction (AVF), myelin volume fraction (MVF), N-ratio,
-and axon density — with full QC overlay output.
+Automated quantitative morphometry pipeline for myelinated nerve fibers in
+toluidine-blue stained semi-thin cross-sections. Developed for a rat peripheral
+nerve regeneration study comparing allograft and autograft repair strategies.
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Recommended Workflow](#recommended-workflow)
-3. [Web Validation UI](#web-validation-ui)
-   - [Running the App](#running-the-app)
-   - [Remote Access (Cloudflare Tunnel)](#remote-access-cloudflare-tunnel)
-4. [Pipeline Architecture](#pipeline-architecture)
-   - [Step 0 — Preprocessing: Contrast Stretch](#step-0--preprocessing-contrast-stretch)
-   - [Step 1 — Cellpose Pass 1: Outer Fibers](#step-1--cellpose-pass-1-outer-fibers)
-   - [Step 2 — Normalized Inversion: Building `axon_input`](#step-2--normalized-inversion-building-axon_input)
-   - [Step 3 — Global Otsu Axon Detection](#step-3--global-otsu-axon-detection)
-   - [Step 4 — Morphometrics](#step-4--morphometrics)
-   - [Step 5 — QC Filtering](#step-5--qc-filtering)
-   - [Step 6 — Visualizations](#step-6--visualizations)
-5. [Mathematics](#mathematics)
-6. [Configuration Reference](#configuration-reference)
-7. [Output Files](#output-files)
-8. [Module Structure](#module-structure)
-9. [Overlay Color Scheme](#overlay-color-scheme)
-10. [References](#references)
+1. [Scientific Context](#scientific-context)
+2. [Pipeline Overview](#pipeline-overview)
+3. [Recommended Workflow](#recommended-workflow)
+4. [Web Validation UI](#web-validation-ui)
+5. [U-Net Architecture and Training](#u-net-architecture-and-training)
+6. [Morphometrics](#morphometrics)
+7. [QC Filtering](#qc-filtering)
+8. [Statistical Analysis](#statistical-analysis)
+9. [Configuration Reference](#configuration-reference)
+10. [Output Files](#output-files)
+11. [Module Structure](#module-structure)
 
 ---
 
-## Overview
+## Scientific Context
 
-Toluidine-blue staining of semi-thin peripheral nerve cross-sections produces
-images where **myelin sheaths appear dark** and **axon interiors appear bright**.
-This pipeline automates the full morphometric analysis:
+### Experimental Design
+
+Peripheral nerve regeneration study in rats. Nerves are imaged after surgical
+repair at two timepoints:
+
+| Code | Meaning |
+|---|---|
+| `allo` | Allograft — nerve from a donor animal |
+| `auto` | Autograft — nerve from the same animal (gold standard) |
+| `X` | Graft alone, no cell supplementation |
+| `A` | Graft + adipose-derived cells |
+| `B` | Graft + bone marrow cells |
+| `O` | Graft + olfactory mucosa cells |
+| `12w` / `16w` | Weeks post-surgery |
+| `L` | Operated paw (grafted) |
+| `R` | Contralateral healthy paw (control) |
+
+Filename convention: `{allo|auto}{A|B|O|X}{timepoint}{animal}{L|R}.tif`
+Example: `alloB12w3L.tif` — allograft + bone marrow cells, 12 weeks, animal 3, operated paw.
+
+### Key Morphometric Outcomes
+
+- **G-ratio** — axon diameter / fiber diameter. Optimal myelination ≈ 0.6.
+  Measures the efficiency of myelin deposition relative to axon size.
+- **N-ratio** — total fiber area / nerve cross-section area. Measures how
+  densely packed myelinated fibers are within the nerve.
+- **AVF / MVF** — axon and myelin volume fractions (proportion of nerve area
+  occupied by axon or myelin compartments).
+- **Axon density** — number of myelinated axons per mm².
+
+---
+
+## Pipeline Overview
 
 ```
-edited TIFF  →  contrast stretch  →  Cellpose (cpsam, outer fibers)
-             →  normalized inversion  →  Otsu threshold (axon blobs)
-             →  morphometrics  →  QC  →  outputs
+TIFF image
+  │
+  ├─ U-Net inference (ResNet34 encoder, 3 classes: bg / myelin / axon)
+  │    Sliding window (512 px tiles, 50% overlap), predictions averaged
+  │    → _cellpose_outer.npy  (fiber instance labels)
+  │    → _axon_inner.npy      (axon instance labels, matched to fiber IDs)
+  │
+  ├─ Fascicle mask  (drawn by clinician in web UI, or auto-estimated)
+  │
+  ├─ QC filtering   (g-ratio, axon position, border, size)
+  │
+  ├─ Morphometrics  (per-fiber ECD, g-ratio, myelin thickness, AVF, MVF…)
+  │
+  └─ Outputs
+       _overlay.png         — color-coded segmentation
+       _morphometrics.csv   — per-axon measurements
+       _aggregate.csv       — image-level statistics
+       _dashboard.png       — histograms + aggregate table
 ```
 
-Key design decisions:
+**Design decisions:**
 
 | Decision | Rationale |
 |---|---|
-| **Cellpose cpsam is the source of truth for fiber count** | Deep-learning segmentation handles touching fibers, irregular shapes, and staining variability better than any threshold-based approach |
-| **Percentile stretch before Cellpose** | Global p2–p98 stretch removes the gray veil, making myelin rings and axon centers pop; improves Cellpose detection without introducing CLAHE artefacts |
-| **Per-fiber normalization before inversion** | Each fiber is contrast-stretched independently, making the axon/myelin contrast invariant to global staining intensity gradients |
-| **Global Otsu on the full `axon_input` image** | All normalized fiber pixels together form a clean bimodal distribution — one threshold for the entire image, no per-fiber fitting |
-| **Manual fascicle mask (web UI)** | The clinician draws the nerve fascicle boundary in the web UI; this mask is used as the denominator for AVF, MVF, N-ratio, and density, and constrains Cellpose to the fascicle area |
-| **Hull-constrained closing** | Axon blob gap-filling uses closing intersected with the convex hull — fills C-shapes without pushing the blob toward the myelin edge |
-| **Dual outer-labels (edited + gt)** | Clinician corrections are split: `_outer_edited.npy` tracks corrected predictions, `_outer_gt.npy` is the complete ground truth (includes additions). The diff reveals model false-negatives for fine-tuning |
-| **Two-level cache** | Cellpose results and axon detections are cached separately so detection parameters can be tuned without re-running Cellpose |
-| **QC overrides** | Clinician can manually accept QC-rejected fibers (mode 9) — stored in `*_qc_overrides.json`, applied on recompute |
-| **Per-stem write lock** | Concurrent edits to the same image are serialized via threading locks, so multi-user sessions can't corrupt `.npy` files |
-
-> **Image preparation:** contrast and brightness must be adjusted manually
-> (with a medical eye) in ImageJ/Fiji before running the pipeline, as optimal
-> settings vary per image and staining batch. Place corrected images in `edited/`.
+| Custom-trained U-Net | Off-the-shelf segmentation tools (Cellpose) do not discriminate axon from myelin; a pixel-level model trained on manual annotations is required |
+| Tile-based inference with 50% overlap | Large TIFFs (>6000 px) cannot be processed in one pass; tile overlap eliminates boundary artifacts via prediction averaging |
+| Manual fascicle mask | The nerve boundary varies in shape and is not reliably estimated from pixel intensity; a clinician-drawn mask ensures a correct anatomical denominator for all area fractions |
+| Multi-core Voronoi partition | When the model merges two adjacent fibers into one label, the fiber area is partitioned among axon blobs by Voronoi tessellation so each axon still contributes a valid individual measurement without discarding the pair |
+| Image-level statistics for group comparisons | Fiber-level pooling introduces pseudo-replication; all group comparisons use one aggregate value per image (≈ one animal) as the statistical unit |
 
 ---
 
 ## Recommended Workflow
 
 ```
-1. Place images in edited/<Group Xw>/<stem>.tif
-   (e.g. edited/ALLO A 12w/alloA12w1L.tif)
+1. Prepare images
+   - Adjust contrast/brightness in ImageJ/Fiji if needed
+   - Place TIFFs in edited/
 
-2. Start the web app
+2. Run U-Net inference
+   python -m train.predict --image edited/GROUP/stem.tif
+   # or batch:
+   ./reinfer.sh
+
+3. Start the web app
    python app.py  →  http://127.0.0.1:8000
 
-3. For each image, draw the fascicle boundary
-   Select image → mode 7 (Fascicle) → click polygon points → close near first point
-   (or double-click to close)
+4. Draw fascicle boundary for each image
+   Mode 7 (Fascicle) → click polygon points → close near first point
 
-4. Run segment.py once all fascicle masks are drawn
-   python segment.py
+5. Review segmentation
+   - Delete false-positive fibers (mode 2)
+   - Correct axon boundaries (mode 3) or fiber boundaries (mode 4)
+   - Erase artifacts (mode 5)
+   - Add missing fibers (mode 6)
+   - Draw exclusion zones for tears/folds (mode 8)
+   - Manually accept a QC-rejected fiber (mode 9)
 
-5. Review results in the web app (works on desktop + iPad with Apple Pencil)
-   - Delete false-positive axons (mode 2)
-   - Add missing fibers (mode 6) — saved to ground truth only for fine-tuning
-   - Draw exclusion zones (mode 8) — artefacts/tears subtracted from nerve area
-   - Accept QC-rejected fibers you disagree with (mode 9)
-   - Click "Recompute" to apply edits to a single image
-   - Images with pending edits show a ⚠ badge in the sidebar
-   - Undo last edit with Ctrl+Z / Cmd+Z
+6. Recompute morphometrics
+   ↻ Recompute (single image)  or  ↻ All (batch, background)
 
-6. Export: output/summary.csv + per-image CSVs in output/<stem>/
+7. Run comparative analysis
+   python compare_all.py
+   → output/comparison/rigorous/
 ```
-
-> **Cache behaviour:** Cellpose results are cached in `*_cellpose_outer.npy`.
-> If the fascicle mask is updated after the last Cellpose run, segment.py
-> automatically invalidates the cache and reruns Cellpose. To force a full
-> rerun on all images, delete the `*_cellpose_outer.npy` files and rerun
-> `segment.py`.
 
 ---
 
 ## Web Validation UI
 
-`app.py` is a FastAPI-based browser UI for manual review and correction of
-segmentation results. It lets a clinician inspect every image, draw fascicle
-boundaries, delete false-positive axons, add missing ones, and trigger
-recomputation — without touching the command line.
-
-### Running the App
+`app.py` is a FastAPI browser application for segmentation review and manual
+correction. Supports desktop and iPad with Apple Pencil.
 
 ```bash
 python app.py
-# → http://127.0.0.1:8000
-#   Login  →  user: axon  |  password: <randomly generated>
+# → http://127.0.0.1:8000  (no password on localhost)
+# → password required via Cloudflare tunnel
+
+APP_PASSWORD=mypassword python app.py  # fixed password for remote
 ```
 
-The password is printed in the terminal at startup and changes every run. To fix a permanent password:
+### Editing Modes
+
+| Key | Mode | Action |
+|---|---|---|
+| 1 | Navigate | Pan / zoom |
+| 2 | Delete | Click a fiber to remove it |
+| 3 | Axon | Lasso → paint axon inside an existing fiber |
+| 4 | Myelin | Lasso → extend or create a fiber boundary |
+| 5 | Erase | Lasso → erase myelin + axon inside zone |
+| 6 | Fiber | Two-step lasso → add a complete new fiber (outer then axon) |
+| 7 | Fascicle | Click polygon → draw fascicle boundary |
+| 8 | Exclude | Polygon → mark exclusion zone (subtracted from nerve area) |
+| 9 | Accept | Click a QC-rejected fiber to manually accept it |
+
+### Overlay Color Scheme
+
+| Color | Meaning |
+|---|---|
+| Green | Axon — QC passed |
+| Blue | Myelin ring — QC passed |
+| Red | Fiber with no axon detected |
+| Crimson | Multi-core fiber (resolved by Voronoi, shown split) |
+| White line | Fascicle boundary |
+
+Rejected fibers are not shown (hidden to reduce visual clutter; count reported
+in the dashboard).
+
+### GT Annotation Mode
+
+Switch with the **GT** button. Used to produce ground-truth labels for model
+training:
+- Mode 6 (+Fiber) draws fiber and axon outlines from scratch
+- Mode 0 (Vessel) marks blood vessels
+- **Mark Validated** locks the annotation for training
+
+---
+
+## U-Net Architecture and Training
+
+### Architecture
+
+- **Encoder:** ResNet34 pretrained on ImageNet
+- **Decoder:** U-Net with skip connections (segmentation-models-pytorch)
+- **Output:** 3-class pixel classification — background (0), myelin (1), axon (2)
+- **Input tile:** 512 × 512 px, RGB
+
+### Loss Function
+
+Combined Dice + Cross-Entropy loss:
+
+$$\mathcal{L} = w_{\text{dice}} \cdot \mathcal{L}_{\text{Dice}} + w_{\text{ce}} \cdot \mathcal{L}_{\text{CE}}$$
+
+The Dice component handles class imbalance at the object level (rewards overlap
+between predicted and ground-truth regions). The cross-entropy component
+stabilizes gradient flow at the pixel level.
+
+**Class weights** are set proportional to the inverse square root of class
+frequency to counteract the severe imbalance between background (dominant),
+myelin (moderate), and axon (rare):
+
+$$w_c = \frac{1}{\sqrt{f_c}} \quad \text{normalized so } \sum_c w_c = 1$$
+
+Empirically derived from pixel-level class frequencies in the annotated dataset:
+`[0.48, 1.11, 1.42]` for background / myelin / axon. Upweighting the axon
+class relative to background prevents the model from learning a trivial
+solution that ignores small axon blobs.
+
+### Training Procedure
 
 ```bash
-APP_PASSWORD=mypassword python app.py
+# Train from scratch
+python -m train.train --epochs 120 --batch 8
+
+# Fine-tune from existing checkpoint
+python -m train.train --resume train/checkpoints/best.pt --epochs 30
+
+# Resume interrupted run
+python -m train.train --resume train/checkpoints/last.pt --epochs 20
+
+# With parallel data loading (recommended on macOS)
+python -m train.train --workers 2
 ```
 
-**Features:**
+**Optimizer:** AdamW, lr=1e-3, weight decay=1e-4  
+**Scheduler:** Cosine annealing (T_max = num_epochs)  
+**Augmentation:** Random flips, rotations, color jitter, elastic deformation  
+**Validation:** Random hold-out split (VAL_SPLIT fraction of annotated stems)  
+**Metric:** mIoU on foreground classes (myelin + axon), ignoring background
 
-| Action | How |
-|---|---|
-| Browse all images | Sidebar — shows axon count, edit status, ⚠ if recompute pending |
-| Blend overlay with raw image | Opacity slider in the header |
-| View overlay / numbered / dashboard / g-ratio map | Buttons per image |
-| Navigate (pan / zoom) | Mode 1 |
-| Delete a false-positive fiber | Mode 2 — click on it |
-| Paint axon inside existing fiber | Mode 3 — freehand lasso |
-| Paint new outer (myelin only) | Mode 4 — freehand lasso (saved to GT only) |
-| Erase region | Mode 5 — freehand lasso |
-| Add a complete fiber (outer + axon) | Mode 6 — two-step lasso (saved to GT only) |
-| Draw fascicle boundary | Mode 7 — click polygon points, close near first point or double-click |
-| Mark exclusion zone | Mode 8 — polygon (subtracted from nerve area) |
-| Accept QC-rejected fiber | Mode 9 — click to toggle; recompute to apply |
-| Clear fascicle | "Clear fascicle" in right panel |
-| Undo last edit | "Undo" button or Ctrl+Z / Cmd+Z |
-| Recompute morphometrics | "Recompute" button (single image) |
-| Recompute all images | "Recompute All" button (background — app stays usable) |
-| Open multi-image comparison | "Compare" button |
+Checkpoints saved to `train/checkpoints/`:
+- `best.pt` — best validation mIoU
+- `last.pt` — last completed epoch
+- `epoch_NNN.pt` — snapshot every 10 epochs
 
-**Multi-user awareness:**
+### Re-inference
 
-When multiple people are connected (e.g. via a Cloudflare tunnel), the sidebar
-shows presence badges indicating how many others are currently viewing each image.
-
-**URL hash routing:**
-
-Selecting an image updates the browser URL to `#stem_name`. Bookmarks and
-shared links jump directly to the right image.
-
-**iPad / Apple Pencil support:**
-
-The app uses Pointer Events for unified mouse/touch/stylus input:
-
-| Gesture | Action |
-|---|---|
-| **Pencil** tap/drag | Active tool (delete, lasso, polygon) |
-| **Finger** drag | Pan |
-| **Finger** pinch | Zoom |
-| Mouse left-click | Active tool |
-| Mouse right-click / middle-click / space+drag | Pan |
-| Mouse wheel | Zoom |
-
-Keyboard shortcuts (1–9, Esc, arrows, F) work with an external keyboard.
-
-**Dual label maps for fine-tuning:**
-
-| File | Content | Purpose |
-|---|---|---|
-| `_outer_edited.npy` | Cellpose + deletions + modifications | Corrected prediction (no additions) |
-| `_outer_gt.npy` | Cellpose + deletions + modifications + additions | Ground truth (complete) |
-
-Deletions and modifications update both files. Manual additions (new fibers the model missed) go only to `_outer_gt.npy`. This lets you compute false-negatives (`gt − edited`) and false-positives (deleted labels) for fine-tuning Cellpose.
-
-All edits are saved to `*_edits.json` and original `.npy` files are kept as
-`*_original.npy` backups. QC overrides (mode 9) are stored in
-`*_qc_overrides.json`. A "Reset" button restores any image to its pre-edit state.
-
-### Remote Access (Cloudflare Tunnel)
-
-To let a collaborator access the app from another computer without any VPN or port-forwarding setup:
+After retraining or bug fixes, update the segmentation caches:
 
 ```bash
-# 1. Install cloudflared (one-time)
-brew install cloudflare/cloudflare/cloudflared
-
-# 2. Start the app and the tunnel in two terminals
-python app.py
-cloudflared tunnel --url http://localhost:8000
+./reinfer.sh          # all images
+./reinfer.sh --dry-run  # preview only
+./reinfer.sh stem1 stem2  # specific images
 ```
 
-Cloudflare prints a public URL (e.g. `https://xyz-abc.trycloudflare.com`). Send it along with the login credentials shown in the app terminal. The tunnel is active only while both processes are running — close them when the session is done.
+Then use **↻ All** in the web app to regenerate morphometrics.
 
-> The app requires HTTP Basic Auth (username + password) for every request, so the tunnel cannot be accessed without credentials.
+### Ground Truth Data
+
+`ground_truth/` is **read-only**. It contains manually annotated reference
+images by the clinician and is the sole source of training labels.
+Never modify, overwrite, or delete any file in this directory.
+
+```
+ground_truth/
+├── images/       # raw images (lossless)
+└── masks/
+    ├── <stem>_outer_gt.npy     # fiber instance labels
+    ├── <stem>_axon_gt.npy      # axon instance labels
+    └── <stem>_vessels_gt.npy   # blood vessel labels
+```
+
+Validation against GT: `python compare_gt.py`
+Current performance: mIoU(fg) = 0.886, Fiber F1 = 0.986 (n=7 annotated images)
 
 ---
 
-## Pipeline Architecture
+## Morphometrics
 
-### Step 0 — Preprocessing: Contrast Stretch
+**File:** `morphometrics.py`
 
-**File:** `detection.py → _clahe_preprocess()`
-**Enabled by:** `CP_CLAHE = True`
+All measurements are computed on bounding-box crops (not full images) to keep
+memory and runtime linear in the number of fibers.
 
-Before Cellpose, the raw image is **globally stretched** from p2–p98 to 0–255.
-This removes the gray veil present in some toluidine-blue images, making the
-myelin ring / axon center pattern more prominent and improving Cellpose detection.
-
-Optionally, CLAHE can be applied after the stretch by setting
-`CLAHE_CLIP_LIMIT > 0`, but in practice the stretch alone performs best.
-
----
-
-### Step 1 — Cellpose Pass 1: Outer Fibers
-
-**File:** `detection.py → run_cellpose_fibers()`
-
-Cellpose ([Stringer et al., 2021](https://doi.org/10.1038/s41592-020-01018-x))
-is a deep-learning instance segmentation model. The `cpsam` model (Cellpose 4)
-is used with `augment=True` (4-orientation averaging) for robust detection of
-myelinated fiber cross-sections (axon + myelin sheath together).
-
-**How Cellpose works:**
-Rather than detecting explicit boundaries, Cellpose uses a gradient-flow
-formulation. It predicts, for every pixel, the 2-D vector pointing toward
-the center of its containing cell. Pixels that converge to the same attractor
-belong to the same cell. This approach is robust to touching and overlapping
-objects.
-
-**Parameters:**
-
-| Parameter | Default | Meaning |
+| Metric | Formula | Notes |
 |---|---|---|
-| `CP_MODEL` | `cpsam` | Cellpose 4 model |
-| `CP_DIAM_UM` | `5.0 µm` | Expected fiber diameter (sets internal rescaling) |
-| `CP_FLOW_THR` | `0.3` | Flow error threshold — lower is more permissive |
-| `CP_CELLPROB` | `-1.0` | Cell probability threshold — lower detects more |
+| Equivalent circular diameter | $d = \sqrt{4A/\pi} \cdot s$ | $s$ = pixel size in µm/px |
+| G-ratio | $g = d_\text{axon} / d_\text{fiber}$ | Per fiber |
+| Myelin thickness | $(d_\text{fiber} - d_\text{axon}) / 2$ | |
+| Axon area | $A_\text{axon} \cdot s^2$ | µm² |
+| Fiber area | $A_\text{fiber} \cdot s^2$ | µm² |
+| Centroid offset | $\|\mathbf{c}_\text{axon} - \mathbf{c}_\text{fiber}\| / r_\text{fiber}$ | Normalized by fiber radius |
 
-**Post-processing:**
-- If a **manual fascicle mask** exists, Cellpose runs only inside the fascicle boundary (background pixels are set to median intensity before passing to Cellpose).
-- Each fiber mask is **eroded** by `OUTER_ERODE_PX` pixels to shrink the fiber boundary and reduce myelin bleed.
-- **Satellite fiber removal**: isolated fibers with fewer than `MIN_SATELLITE_NEIGHBORS` neighbours within 5× fiber diameter are removed (skipped when a fascicle mask is present).
-- **Low-QC cluster removal**: clusters of fibers with a QC pass rate below `MIN_CLUSTER_QC_RATE` or fewer than `MIN_CLUSTER_FRACTION` × largest-cluster fiber count are removed.
+**Aggregate (image-level):**
 
-**Output:** An integer label array cached as `*_cellpose_outer.npy`.
+$$g_\text{area-weighted} = \sqrt{\frac{\sum_i A_{\text{axon},i}}{\sum_i A_{\text{fiber},i}}}$$
 
----
+$$\text{AVF} = \frac{\sum_i A_{\text{axon},i}}{A_\text{nerve}} \qquad \text{MVF} = \frac{\sum_i (A_{\text{fiber},i} - A_{\text{axon},i})}{A_\text{nerve}}$$
 
-### Step 2 — Normalized Inversion: Building `axon_input`
+$$\text{N-ratio} = \frac{\sum_{\text{all}} A_{\text{fiber},i}}{A_\text{nerve} - A_\text{exclusion}}$$
 
-**File:** `preprocessing.py → _invert_crop(), build_axon_input()`
+N-ratio counts ALL detected fibers (QC-passed and rejected) because every
+myelinated fiber physically occupies nerve cross-section regardless of
+measurement quality. AVF and MVF use QC-passed fibers only.
 
-This step transforms each fiber crop so that:
+### Multi-Core Fibers
 
-- **Axon interior** (originally bright) → **dark blob ≈ 0**
-- **Myelin sheath** (originally dark) → **bright ring ≈ 255**
-- **Background / boundary** → **white = 255** (excluded)
-
-> Note: this step always uses the **original raw image**, not the
-> contrast-stretched version used by Cellpose.
-
-#### 2a — Distance-Transform Boundary Erosion
-
-A Euclidean distance transform on the fiber mask excludes the boundary zone
-where endoneurium contamination is likely. Erosion depth is capped at 25% of
-the fiber equivalent radius to preserve signal in small fibers.
-
-#### 2b — Per-Fiber Percentile Stretch
-
-Contrast is normalized using the 5th–95th percentile of clean interior pixels:
-
-$$I_{\text{stretched}}(x,y) = \text{clip}\!\left(\frac{I(x,y) - p_5}{p_{95} - p_5} \cdot 255,\ 0,\ 255\right)$$
-
-#### 2c — Inversion
-
-$$I_{\text{inverted}}(x,y) = 255 - I_{\text{stretched}}(x,y)$$
-
-#### 2d — Inward Fade
-
-A smooth fade from white at the eroded edge to fully inverted at `FADE_PX`
-pixels inward prevents hard black ring artefacts at the boundary.
+When the U-Net assigns a single fiber label to a region containing two
+distinct axon blobs (adjacent fibers not separated by the model), the fiber
+pixels are partitioned by Voronoi tessellation: each axon blob inherits the
+fiber pixels geometrically closest to it. This yields two virtual fiber labels,
+each with its own axon area and fiber area, enabling a valid individual g-ratio
+for each without discarding the pair.
 
 ---
 
-### Step 3 — Global Otsu Axon Detection
+## QC Filtering
 
-**File:** `detection.py → find_axons()`
+**File:** `qc.py`
 
-Otsu's method finds the threshold that maximises inter-class variance over
-all fiber pixels:
+Each fiber is tested sequentially. The first failing test determines its
+rejection code (shown on the overlay and counted in the dashboard).
 
-$$t^* = \arg\max_t \; \omega_0(t)\,\omega_1(t)\,\bigl[\mu_0(t) - \mu_1(t)\bigr]^2$$
+| Code | Filter | Threshold |
+|---|---|---|
+| `out` | Axon pixels outside fiber boundary | > 5% |
+| `G` | G-ratio out of physiological range | outside [0.1, 0.9] |
+| `lgG` | Large fiber (≥ p85) with low g-ratio | g < 0.15 |
+| `Ø` | Axon diameter too small | < 0.1 µm |
+| `brd` | Fiber touches image border | always excluded |
 
-**Why global?** Per-fiber normalization makes all axon pixels cluster around
-~0–80 and all myelin pixels around ~180–255 across the entire image, giving a
-clean bimodal histogram. Global Otsu is simpler and more stable than per-fiber
-thresholding.
-
-After thresholding, the correct axon blob is selected by centroid (falls back
-to largest blob). Multicore fibers (multiple distinct blobs) are flagged.
-
-**Post-processing per blob:**
-
-1. **Hull-constrained closing** — `binary_closing(disk(6)) & convex_hull_image()`.
-   Closing fills C-shape gaps; intersecting with the convex hull prevents the
-   blob from being pushed toward the nearest myelin edge (the original
-   `closing(disk(8))` caused axons to "stick" to the myelin on one side).
-2. **Adaptive myelin margin** — the axon must be at least
-   `max(AXON_MIN_MYELIN_PX, AXON_MIN_MYELIN_FRAC × fiber_radius)` pixels from
-   the fiber edge. Large fibers get a proportionally larger gap.
-3. **Gaussian smoothing** (`AXON_SMOOTH_SIGMA`) — smooths the perimeter.
-4. **Adaptive dilation** (`AXON_DILATE_PX`) — compensates for Otsu
-   under-segmentation. Reduced for large fibers.
-5. **Morphological opening** (`AXON_OPEN_PX`) — removes thin protrusions.
-6. All operations are clipped to the margin mask (hard guarantee).
+Thresholds are permissive by default; adjust in `config.py`. A clinician can
+override individual rejections using mode 9 (Accept) in the web UI.
 
 ---
 
-### Step 4 — Morphometrics
+## Statistical Analysis
 
-**File:** `morphometrics.py → process_fibers()`
+**Script:** `python compare_all.py`
 
-All measurements use physical units (µm) via `PIXEL_SIZE`. Operations run on
-bounding-box crops for efficiency.
+Produces four figures and a complete statistics CSV in
+`output/comparison/rigorous/`:
 
-| Metric | Formula |
+| Output | Description |
 |---|---|
-| ECD | $\sqrt{4A/\pi} \cdot \texttt{PIXEL\_SIZE}$ |
-| G-ratio | $d_{\text{axon}} / d_{\text{fiber}}$ |
-| Myelin thickness | $(d_{\text{fiber}} - d_{\text{axon}}) / 2$ |
-| Centroid offset | $\|\mathbf{c}_{\text{axon}} - \mathbf{c}_{\text{fiber}}\| / \sqrt{A_{\text{fiber}}/\pi}$ |
+| `01_overview.png` | 9 groups × 6 metrics, bars = mean ± 95% CI, stars vs healthy |
+| `02_recovery_heatmap.png` | % recovery toward healthy control per group × metric |
+| `03_timepoint.png` | 12w vs 16w comparison within each group |
+| `04_violins.png` | Fiber-level distributions for g-ratio, axon diameter, myelin thickness |
+| `stats_complets.csv` | Full table: n, mean, SD, CI95, p (raw), p (Bonferroni × 8), Cohen's d, % recovery |
 
-**Aggregate stats** (`compute_aggregate()`):
+**Statistical unit:** one image ≈ one animal. Fiber-level values are not used
+directly in group tests to avoid pseudo-replication.
 
-- **N-ratio** counts ALL detected fibers (pass + rejected + no-axon) because
-  every fibre occupies nerve cross-section regardless of health.
-- **AVF / MVF / G-ratio / density** use QC-passed fibers only (functional population).
-- **Area-weighted g-ratio** $\sqrt{\sum A_\text{axon} / \sum A_\text{fiber}}$ is reported alongside the arithmetic mean.
-- **Exclusion zones** (artefacts, tears drawn in the web UI) are subtracted
-  from the fascicle area denominator so they don't dilute the ratios.
-- The fascicle area (manual or auto-computed) is the base denominator.
+**Tests:** Mann-Whitney U (non-parametric, no normality assumption).
+Multiple comparisons corrected by Bonferroni (× 8 graft groups vs healthy).
 
----
-
-### Step 5 — QC Filtering
-
-**File:** `qc.py → apply_qc()`
-
-| Code | Filter | Default threshold |
-|---|---|---|
-| `G` | G-ratio | $[0.3,\ 0.9]$ |
-| `lgG` | Large-fiber g-ratio (≥ p85) | g < 0.5 |
-| `shp` | Shape discordance | fiber_solidity − axon_solidity > 0.2 |
-| `sol` | Solidity | ≥ 0.1 |
-| `off` | Centroid offset | ≤ 0.95 |
-| `Ø` | Axon diameter | ≥ 0.5 µm |
-| `brd` | Image border | excluded |
-
-All thresholds are intentionally permissive — adjust in `config.py`.
-
----
-
-### Step 6 — Visualizations
-
-**File:** `visualization.py`
-
-- **`*_overlay.png`** — Full-resolution color-coded overlay (green axon, blue myelin, rejection colors, white fascicle boundary)
-- **`*_numbered.png`** — Overlay with sequential numbers on QC-passed axons + stats banner
-- **`*_gratio_map.png`** — Per-axon g-ratio heatmap (RdYlGn colormap) — only generated when `GRATIO_MAP = True`
-- **`*_dashboard.png`** — 2×4 layout: histograms (axon diam, fiber diam, g-ratio, myelin thickness), scatter plots, rejection breakdown, and aggregate metrics table
-
----
-
-## Mathematics
-
-$$d_{\text{ECD}} = \sqrt{\frac{4A}{\pi}} \cdot s \qquad (s = \texttt{PIXEL\_SIZE},\ \text{µm/px})$$
-
-$$g = \frac{d_{\text{axon}}}{d_{\text{fiber}}}$$
-
-$$t_{\text{myelin}} = \frac{d_{\text{fiber}} - d_{\text{axon}}}{2}$$
-
-$$\delta_{\text{offset}} = \frac{\|\mathbf{c}_{\text{axon}} - \mathbf{c}_{\text{fiber}}\|_2}{\sqrt{A_{\text{fiber}}/\pi}}$$
-
-$$\text{AVF} = \frac{\displaystyle\sum_i A_{\text{axon},i}}{A_{\text{fascicle}}}$$
-
-$$\text{MVF} = \frac{\displaystyle\sum_i \bigl(A_{\text{fiber},i} - A_{\text{axon},i}\bigr)}{A_{\text{fascicle}}}$$
-
-$$\text{N-ratio} = \frac{\displaystyle\sum_{\text{all fibers}} A_{\text{fiber},i}}{A_{\text{fascicle}} - A_{\text{exclusion}}}$$
-
-$$\text{density} = \frac{N}{A_{\text{fascicle}} \cdot 10^{-6}} \quad [\text{axons/mm}^2]$$
-
-$$g_{\text{area-weighted}} = \sqrt{\frac{\sum_i A_{\text{axon},i}}{\sum_i A_{\text{fiber},i}}}$$
+**Stem parsing:** group membership is inferred from the filename via regex
+`(allo|auto)([ABOX])(\d+w)\d*(L|R)`. Files ending in `R` are pooled as
+healthy controls; files ending in `L` are grafted.
 
 ---
 
 ## Configuration Reference
 
-All parameters live in `config.py`. Edit there — no code changes needed.
+All tunable parameters in `config.py`:
 
 ```python
-# I/O
-INPUT_DIR  = Path("edited")   # source TIFF directory (subfolders = group/timepoint)
-OUTPUT_DIR = Path("output")   # results directory
-PIXEL_SIZE = 0.09             # µm per pixel at acquisition resolution
+PIXEL_SIZE  = 0.09   # µm/px at acquisition resolution
+INPUT_DIR   = Path("edited")
+OUTPUT_DIR  = Path("output")
 
-# Cellpose — pass 1 (outer fibers)
-CP_MODEL    = "cpsam"   # Cellpose 4 model
-CP_DIAM_UM  = 5.0       # expected fiber diameter (µm)
-CP_FLOW_THR = 0.3       # flow error threshold (lower = more permissive)
-CP_CELLPROB = -1.0      # cell probability threshold (lower = more detections)
+FIBER_DIAM_UM = 5.0  # expected fiber diameter — used for fascicle masking
 
-# Contrast preprocessing (applied before Cellpose only)
-CP_CLAHE        = True   # enable contrast stretch before Cellpose
-CLAHE_CLIP_LIMIT = 0.0   # 0 = stretch only; >0 = stretch + CLAHE
-CLAHE_TILE_SIZE  = (64, 64)
-STRETCH_PLOW    = 2      # low percentile for stretch
-STRETCH_PHIGH   = 98     # high percentile for stretch
+MIN_AXON_SIZE  = 40  # minimum axon blob area (px²) — smaller blobs ignored
+OUTER_ERODE_PX = 2   # erode fiber mask before morphometrics (px)
+GRATIO_MAP     = False  # spatial g-ratio heatmap (slow, enable only if needed)
 
-# Inversion / preprocessing (axon_input — uses original raw image)
-MASK_ERODE_PX       = 4    # boundary erosion depth (px)
-FADE_PX             = 8    # inward fade length (px)
-MIN_AXON_SIZE       = 40   # minimum axon blob area (px²)
-AXON_SMOOTH_SIGMA   = 1.5  # Gaussian sigma for axon perimeter smoothing (0 = off)
-AXON_DILATE_PX      = 3    # expand axon mask after hull-constrained closing (0 = off)
-AXON_OPEN_PX        = 2    # morphological opening to remove thin protrusions (0 = off)
-AXON_MIN_MYELIN_PX  = 2    # hard floor: axon ≥ this many px from fiber edge
-AXON_MIN_MYELIN_FRAC = 0.30 # adaptive floor: axon ≥ frac × fiber_radius from edge
-OUTER_ERODE_PX      = 2    # erode fiber mask before morphometrics (px)
-AXON_INPUT_WHITE_POINT = 255  # clip white point of axon_input (255 = off)
-GRATIO_MAP          = False   # spatial g-ratio heatmap (slow — enable only if needed)
-
-# QC filters (permissive by default — adjust per study)
-MIN_GRATIO             = 0.3
+# QC thresholds
+AXON_OUT_MAX_FRAC      = 0.05   # max fraction of axon pixels outside fiber
+MIN_GRATIO             = 0.1
 MAX_GRATIO             = 0.9
-LARGE_FIBER_MIN_GRATIO = 0.5   # g-ratio floor for large fibers
-LARGE_FIBER_PERCENTILE = 85    # "large fiber" = top 15% by fiber area
-MIN_AXON_DIAM_UM       = 0.5
-MIN_SOLIDITY           = 0.1
-MAX_SHAPE_DISCORDANCE  = 0.2
-MAX_CENTROID_OFFSET    = 0.95
-MAX_AXON_ECCEN         = 1.0   # effectively disabled
+LARGE_FIBER_MIN_GRATIO = 0.15
+LARGE_FIBER_PERCENTILE = 85
+MIN_AXON_DIAM_UM       = 0.1
 EXCLUDE_BORDER         = True
 
-# Satellite / cluster removal (skipped when fascicle mask is present)
-MIN_SATELLITE_NEIGHBORS = 15   # min neighbours within 5× fiber diam
-MIN_CLUSTER_QC_RATE     = 0.50 # clusters below this pass rate are removed
-MIN_CLUSTER_FRACTION    = 0.10 # clusters < 10% of largest cluster are removed
+# Satellite / low-QC cluster removal (applied when no fascicle mask)
+MIN_SATELLITE_NEIGHBORS = 15
+MIN_CLUSTER_QC_RATE     = 0.50
+MIN_CLUSTER_FRACTION    = 0.10
 ```
-
-**Tuning guide:**
-
-| Symptom | Fix |
-|---|---|
-| Cellpose detects large non-fiber structures | Add a fascicle mask in the web UI |
-| Cellpose misses small fibers | Decrease `CP_DIAM_UM` or `CP_CELLPROB` |
-| Cellpose over-segments | Increase `CP_DIAM_UM` or `CP_FLOW_THR` |
-| Dark rings in `*_axon_input.png` | Increase `MASK_ERODE_PX` |
-| Hard edge at fiber boundary | Increase `FADE_PX` |
-| Too many QC rejections | Loosen thresholds in `config.py` |
-| Re-run axon detection only | Delete `*_axon_inner.npy` |
-| Re-run Cellpose only | Delete `*_cellpose_outer.npy` |
-| Re-run everything | Delete both caches above |
 
 ---
 
 ## Output Files
 
-For each input image `Foo.tif`, results are saved in `output/Foo/`:
+For each input image `stem.tif`, results are written to `output/stem/`:
 
 | File | Description |
 |---|---|
-| `Foo_cellpose_outer.npy` | Cellpose fiber label array **(cache)** |
-| `Foo_axon_inner.npy` | Axon detection label array **(cache)** |
-| `Foo_multicore_labels.npy` | Fiber IDs flagged as multicore **(cache)** |
-| `Foo_fascicle_mask.npy` | Auto-computed fascicle mask |
-| `Foo_fascicle_mask_edited.npy` | Manual fascicle mask (drawn in web UI) — takes priority |
-| `Foo_raw.png` | Raw input image cached as PNG |
-| `Foo_axon_input.png` | Normalized-inverted debug image (axon=dark, myelin=bright) |
-| `Foo_overlay.png` | Full-resolution colour-coded overlay |
-| `Foo_numbered.png` | Overlay with numbered QC-passed axons + stats banner |
-| `Foo_gratio_map.png` | Per-axon g-ratio heatmap (RdYlGn) — only when `GRATIO_MAP = True` |
-| `Foo_dashboard.png` | Morphometry dashboard |
-| `Foo_morphometrics.csv` | Per-axon measurements (QC-passed only) |
-| `Foo_morphometrics.xlsx` | Same as CSV in Excel format |
-| `Foo_aggregate.csv` | Image-level aggregates (AVF, MVF, N-ratio, density, mean g-ratio) |
-| `Foo_exclusion_mask.npy` | User-drawn exclusion zones (artefacts, tears) |
-| `Foo_edits.json` | Manual edit history (deleted/added fibers) |
-| `Foo_qc_overrides.json` | Fiber labels manually accepted via mode 9 (QC Accept) |
-| `Foo_outer_edited.npy` | Corrected prediction: Cellpose + deletions/modifications (no additions) |
-| `Foo_outer_gt.npy` | Ground truth: Cellpose + deletions/modifications + manual additions |
-| `Foo_axon_inner_original.npy` | Backup of axon labels before editing |
-| `Foo_axon_version.txt` | Cache version marker — triggers axon cache rebuild on version bump |
-| `Foo_*_undo.npy` | Single-level undo snapshots (axon + outer_edited + outer_gt) |
+| `stem_cellpose_outer.npy` | U-Net fiber instance labels **(cache)** |
+| `stem_axon_inner.npy` | U-Net axon instance labels **(cache)** |
+| `stem_fascicle_mask.npy` | Auto-computed fascicle mask |
+| `stem_fascicle_mask_edited.npy` | Clinician-drawn fascicle mask (takes priority) |
+| `stem_exclusion_mask.npy` | User-drawn exclusion zones |
+| `stem_overlay.png` | Color-coded segmentation overlay |
+| `stem_numbered.png` | Overlay with numbered QC-passed axons + stats banner |
+| `stem_dashboard.png` | Histograms + aggregate metrics table |
+| `stem_morphometrics.csv` | Per-axon measurements (QC-passed only) |
+| `stem_morphometrics.xlsx` | Same in Excel format |
+| `stem_aggregate.csv` | Image-level aggregates (AVF, MVF, N-ratio, g-ratio, density) |
+| `stem_outer_edited.npy` | U-Net labels after clinician deletions/corrections |
+| `stem_outer_gt.npy` | Complete GT: U-Net + all manual additions |
+| `stem_qc_overrides.json` | Fiber IDs manually accepted via mode 9 |
 
-A global `output/summary.csv` collects aggregate metrics across all images.
+Global: `output/summary.csv` — one aggregate row per processed image.
 
 ---
 
@@ -507,102 +413,25 @@ A global `output/summary.csv` collects aggregate metrics across all images.
 
 ```
 hybrid-axon-seg/
-├── segment.py          # Entry point — process_image() + main()
-├── app.py              # Web validation UI (FastAPI) — fascicle drawing, correction, recompute
+├── segment.py          # CLI entry — orchestrates full pipeline
+├── app.py              # Web validation UI (FastAPI)
 ├── config.py           # All tunable parameters
-├── utils.py            # Image type conversion, font loading, satellite/cluster detection
-├── preprocessing.py    # Per-fiber normalized inversion → axon_input
-├── detection.py        # Cellpose pass 1 (with stretch preprocessing) + Otsu axon detection
-├── morphometrics.py    # Per-fiber geometry + aggregate metrics
-├── qc.py               # QC filters with rejection reason tracking
-├── visualization.py    # Overlay, numbered image, g-ratio map, dashboard
-├── compare.py          # Group comparison dashboard
-├── clean_output.py     # Remove generated files (keep fascicle masks + raws)
-├── test_one.py         # Quick single-image test runner
-└── static/             # Web UI assets (app.js, style.css, index.html)
+├── morphometrics.py    # Per-fiber geometry + image-level aggregates
+├── qc.py               # QC filters with rejection reason codes
+├── visualization.py    # Overlay, numbered image, dashboard
+├── compare_all.py      # Full rigorous statistical analysis (9 groups)
+├── compare_gt.py       # Pipeline validation vs ground-truth annotations
+├── compare.py          # Generic cross-sample comparison dashboard
+├── utils.py            # Satellite/cluster detection, shared I/O helpers
+├── reinfer.sh          # Re-run U-Net inference on all or specific images
+├── backup_gt.sh        # Backup ground_truth/ + model checkpoints
+├── static/             # Web UI (app.js, style.css, index.html)
+└── train/
+    ├── train.py        # Training loop (AdamW + cosine LR, DiceCE loss)
+    ├── predict.py      # Sliding-window inference → instance labels
+    ├── dataset.py      # GTDataset — tile extraction from ground_truth/
+    ├── model.py        # build_model() — ResNet34 U-Net via smp
+    ├── losses.py       # DiceCE loss with per-class weighting
+    ├── config.py       # Training hyperparameters
+    └── checkpoints/    # best.pt, last.pt, epoch_NNN.pt
 ```
-
-**Data flow:**
-
-```
-img (TIFF)
-  │
-  ├── [detection.py]      _clahe_preprocess()    →  img_stretched (Cellpose only)
-  │                       run_cellpose_fibers()  →  outer_labels  (cached)
-  │                       satellite/cluster removal
-  │
-  ├── [preprocessing.py]  build_axon_input(img)  →  axon_input  (uses raw img)
-  │                                                 saved as *_axon_input.png
-  │
-  ├── [detection.py]      find_axons()           →  axon_assignments
-  │
-  ├── [morphometrics.py]  process_fibers()       →  inner_labels, df_all
-  │                       compute_aggregate()    →  agg (nratio, avf, mvf, …)
-  │
-  ├── [qc.py]             apply_qc()             →  df_pass, df_rej
-  │
-  └── [visualization.py]  make_overlay()         →  *_overlay.png
-                          make_numbered()        →  *_numbered.png
-                          make_gratio_map()      →  *_gratio_map.png
-                          make_dashboard()       →  *_dashboard.png
-```
-
----
-
-## Overlay Color Scheme
-
-The overlay uses fill regions + 1-px contour boundaries:
-
-**QC-passed fibers:**
-```
-  █  Green    (0,210,60)   Axon fill + (0,240,80) contour
-  █  Blue     (50,50,240)  Myelin fill + contour
-```
-
-**Rejected fibers:**
-```
-  █  Orange   (255,140,0)  Axon fill + contour — detected but QC rejected
-```
-
-**Other:**
-```
-  █  Red          (220,50,50)   No axon detected — Otsu found no dark blob
-  █  Crimson      (210,50,85)   Multi-core fiber (2+ cores → excluded)
-  ─  White                      Fascicle boundary — manual or auto-computed
-```
-
-**Dashboard rejection breakdown** uses per-reason colors:
-```
-  █  Orange       (255,140,0)   G      g-ratio outside [MIN_GRATIO, MAX_GRATIO]
-  █  Red-orange   (255,70,30)   lgG    large fiber with g-ratio below floor
-  █  Amber        (220,200,0)   shp    shape discordance (round fiber, irregular axon)
-  █  Purple       (180,60,210)  sol    solidity below threshold
-  █  Sky blue     (30,170,230)  off    centroid offset above threshold
-  █  Pink         (240,60,140)  ecc    eccentricity above threshold
-  █  Teal         (20,200,160)  Ø      axon diameter below resolution limit
-  █  Grey         (160,160,160) brd    fiber touches image border
-```
-
----
-
-## References
-
-- **Stringer, C., Wang, T., Michaelos, M., & Pachitariu, M. (2021).**
-  Cellpose: a generalist algorithm for cellular segmentation.
-  *Nature Methods*, 18, 100–106.
-  https://doi.org/10.1038/s41592-020-01018-x
-
-- **Otsu, N. (1979).**
-  A threshold selection method from gray-level histograms.
-  *IEEE Transactions on Systems, Man, and Cybernetics*, 9(1), 62–66.
-  https://doi.org/10.1109/TSMC.1979.4310076
-
-- **Rushton, W. A. H. (1951).**
-  A theory of the effects of fibre size in medullated nerve.
-  *Journal of Physiology*, 115(1), 101–122.
-  *(Original formulation of the g-ratio concept)*
-
-- **Chomiak, T., & Hu, B. (2009).**
-  What is the optimal value of the g-ratio for myelinated fibers in the rat CNS?
-  *PLOS ONE*, 4(11), e7754.
-  https://doi.org/10.1371/journal.pone.0007754
