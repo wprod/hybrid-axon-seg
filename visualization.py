@@ -232,7 +232,7 @@ def make_overlay(
 
     # ── Fascicle boundary — striped overlay drawn first (behind everything) ──
     if fascicle_mask is None:
-        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.CP_DIAM_UM)
+        fascicle_mask = build_fascicle_mask(outer_labels, config.PIXEL_SIZE, config.FIBER_DIAM_UM)
 
     # 2px semi-transparent white perimeter
     fascicle_boundary = find_boundaries(fascicle_mask, mode="outer")
@@ -249,9 +249,6 @@ def make_overlay(
     _blend(no_axon, [220, 50, 50])
     _blend(multicore_mask, [210, 50, 85])  # crimson-red (distinct from plain red)
 
-    _blend(rej_myel, [200, 120, 30], alpha=0.35)
-    _blend(rej_axon, [255, 140, 0])
-
     _blend(pass_myel, [50, 50, 240])
     _blend(pass_axon, [0, 210, 60])
 
@@ -259,13 +256,13 @@ def make_overlay(
     outer_c = find_boundaries(outer_labels, mode="inner")
     inner_c = find_boundaries(inner_labels, mode="inner")
 
-    overlay[outer_c] = [70, 70, 220]
+    # Blue contour only for passed fibers (rejected fibers are invisible)
+    pass_outer_c = outer_c & np.isin(outer_labels, list(pass_fibers))
+    overlay[pass_outer_c] = [70, 70, 220]
 
     # Green contour only for passed axons
     pass_c = inner_c & np.isin(inner_labels, list(pass_fibers))
     overlay[pass_c] = [0, 240, 80]
-
-    overlay[inner_c & np.isin(inner_labels, list(rej_fibers))] = [255, 140, 0]
 
     # ── PIL layer — legend only (no per-fiber badges) ─────────────────────
     pil = Image.fromarray(overlay)
@@ -275,7 +272,6 @@ def make_overlay(
     entries = [
         ([0, 210, 60], "Axon — QC passed"),
         ([50, 50, 240], "Myelin — QC passed"),
-        ([255, 140, 0], "Detected — QC rejected"),
         ([210, 50, 85], "Multi-core (excluded)"),
         ([220, 50, 50], "No axon found"),
     ]
@@ -543,7 +539,7 @@ def make_dashboard(
 
         # Metrics table (bottom half) — clinician key metrics first
         tbl_rows = [
-            ["Cellpose fibers", str(n_outer)],
+            ["U-Net fibers", str(n_outer)],
             ["— valid", str(len(df))],
             ["— QC rejected", str(len(df_rej))],
             ["— multi-core", str(n_multicore)],

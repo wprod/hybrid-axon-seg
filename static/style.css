@@ -79,12 +79,20 @@ main{flex:1;display:flex;overflow:hidden}
 .sidebar-title{font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
 .badge{font-size:10px;background:var(--brd);color:var(--txt);padding:1px 7px;border-radius:9px}
 #img-list{flex:1;overflow-y:auto;list-style:none}
-#img-list li{padding:7px 12px;cursor:pointer;border-bottom:1px solid var(--brd);
+/* Category groups */
+.cat-header{list-style:none;padding:3px 10px;user-select:none;
+  background:var(--bg2);position:sticky;top:0;z-index:1;
+  font-size:9px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);
+  border-top:1px solid var(--brd);border-bottom:1px solid var(--brd);margin-top:2px}
+.cat-list{list-style:none;padding:0;margin:0}
+.cat-items{list-style:none;padding:0;margin:0}
+/* Items */
+.cat-list li{padding:7px 12px 7px 20px;cursor:pointer;border-bottom:1px solid var(--brd);
   display:flex;align-items:center;gap:8px;font-size:11px;transition:background .12s}
-#img-list li:hover{background:var(--bg3)}
-#img-list li.active{background:var(--accent);color:#000}
-#img-list li.active .dot{border-color:#000}
-#img-list li.active .img-n{color:#000}
+.cat-list li:hover{background:var(--bg3)}
+.cat-list li.active{background:var(--accent);color:#000}
+.cat-list li.active .dot{border-color:#000}
+.cat-list li.active .img-n{color:#000}
 .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;border:1px solid transparent}
 .dot.orig{background:var(--muted)}
 .dot.mod{background:var(--amber)}

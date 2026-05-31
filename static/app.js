@@ -23,6 +23,7 @@ class App {
     this.spaceHeld = false;
     this.drawing = false;
     this.drawPts = [];
+    this._rafId = null;  // 25fps render throttle for drawing
 
     // fiber mode (two-step lasso: outer then inner)
     this.fiberStep = 0;
@@ -47,6 +48,7 @@ class App {
 
     // GT mode
     this.gtMode = false;
+    this._badGratioFibers = [];
 
     // processed state per stem
     this.processedMap = new Map();
@@ -108,6 +110,7 @@ class App {
       $('#gt-banner').classList.remove('hidden');
       $('#btn-recompute').classList.add('hidden');
       $('#btn-reset').classList.add('hidden');
+
       $('#btn-recompute-all').classList.add('hidden');
       $$('.view-btn').forEach(b => b.classList.add('hidden'));
       $('#btn-compare').classList.add('hidden');
@@ -150,6 +153,7 @@ class App {
     $('#btn-undo').onclick = () => this.undo();
     $('#btn-recompute').onclick = () => this.recompute();
     $('#btn-reset').onclick = () => this.reset();
+
     $('#btn-clear-fasc').onclick = () => this.clearFascicle();
     $('#btn-clear-excl').onclick = () => this.clearExclusion();
     $('#btn-recompute-all').onclick = () => this.recomputeAll();
@@ -261,7 +265,16 @@ class App {
     this.processedMap = new Map(imgs.map(i => [i.stem, i.processed]));
     const ul = $('#img-list');
     ul.innerHTML = '';
+
+    // Group images by group name (ungrouped = empty string → rendered flat)
+    const byGroup = new Map();
     for (const i of imgs) {
+      const key = i.group || '';
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(i);
+    }
+
+    const makeItem = (i) => {
       const li = document.createElement('li');
       li.dataset.stem = i.stem;
       const dotCls = i.modified ? 'mod' : (i.processed ? 'orig' : 'raw');
@@ -273,8 +286,25 @@ class App {
         `${resegBadge}` +
         `<span class="img-n">${nLabel}</span>`;
       li.onclick = () => this.select(i.stem);
-      ul.appendChild(li);
+      return li;
+    };
+
+    const hasGroups = byGroup.size > 1 || (byGroup.size === 1 && !byGroup.has(''));
+    if (!hasGroups) {
+      // Flat list — no groups
+      for (const i of imgs) ul.appendChild(makeItem(i));
+    } else {
+      for (const [group, items] of byGroup) {
+        if (group) {
+          const hdr = document.createElement('li');
+          hdr.className = 'cat-header';
+          hdr.textContent = group;
+          ul.appendChild(hdr);
+        }
+        for (const i of items) ul.appendChild(makeItem(i));
+      }
     }
+
     $('#img-count').textContent = imgs.length;
   }
 
@@ -287,6 +317,7 @@ class App {
     // Hide production-only controls in GT mode
     $('#btn-recompute').classList.toggle('hidden', this.gtMode);
     $('#btn-reset').classList.toggle('hidden', this.gtMode);
+
     $('#btn-recompute-all').classList.toggle('hidden', this.gtMode);
     $$('.view-btn').forEach(b => b.classList.toggle('hidden', this.gtMode));
     $('#btn-compare').classList.toggle('hidden', this.gtMode);
@@ -312,7 +343,8 @@ class App {
     const ul = $('#img-list');
     ul.innerHTML = '';
     let nValidated = 0;
-    for (const i of imgs) {
+
+    const makeItem = (i) => {
       const li = document.createElement('li');
       li.dataset.stem = i.stem;
       const validated = i.status === 'validated';
@@ -326,8 +358,30 @@ class App {
         `${checkBadge}` +
         `<span class="img-n">${nLabel}</span>`;
       li.onclick = () => this.select(i.stem);
-      ul.appendChild(li);
+      return li;
+    };
+
+    const byGroup = new Map();
+    for (const i of imgs) {
+      const key = i.group || '';
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(i);
     }
+    const hasGroups = byGroup.size > 1 || (byGroup.size === 1 && !byGroup.has(''));
+    if (!hasGroups) {
+      for (const i of imgs) ul.appendChild(makeItem(i));
+    } else {
+      for (const [group, items] of byGroup) {
+        if (group) {
+          const hdr = document.createElement('li');
+          hdr.className = 'cat-header';
+          hdr.textContent = group;
+          ul.appendChild(hdr);
+        }
+        for (const i of items) ul.appendChild(makeItem(i));
+      }
+    }
+
     $('#img-count').textContent = imgs.length;
     $('#gt-progress').textContent = `${nValidated}/${imgs.length}`;
   }
@@ -472,17 +526,24 @@ class App {
         tb.appendChild(tr);
       }
     };
+    const badG = info.fibers.filter(f => f.gratio !== null && (f.gratio < 0.2 || f.gratio > 0.9));
     const rows = [
       ['Fibers annotated', info.n_fibers, true],
       ['With axon',  info.fibers.filter(f => f.has_axon).length, true],
       ['Without axon', info.fibers.filter(f => !f.has_axon).length, false],
+      ['Bad g-ratio', badG.length, badG.length > 0],
       ['Vessels', info.n_vessels || 0, (info.n_vessels || 0) > 0],
       ['Status', info.status === 'validated' ? '✓ Validated' : 'In progress', info.status === 'validated'],
     ];
     fill($('#tbl-metrics'), rows);
-    fill($('#tbl-seg'), []);
-    $('#edit-info').textContent = '';
+    // Show bad g-ratio fibers in seg table so clinician can click to navigate
+    const segRows = badG.map(f => [`#${f.label} g=${f.gratio}`, `(${f.x}, ${f.y})`, true]);
+    fill($('#tbl-seg'), segRows);
+    $('#edit-info').textContent = badG.length ? `${badG.length} fibers with suspect g-ratio` : '';
     $('#panel').classList.remove('stale');
+
+    // Store bad-gratio fiber positions for rendering markers
+    this._badGratioFibers = badG;
 
     // Update validate button state
     const vBtn = $('#btn-gt-validate');
@@ -693,6 +754,27 @@ class App {
       ctx.font = `bold ${Math.max(11, 13 / this.zoom)}px sans-serif`;
       ctx.fillStyle = '#F1C40F'; ctx.textAlign = 'center';
       ctx.fillText(label, top[0], top[1] - 8 / this.zoom);
+      ctx.restore();
+    }
+
+    // ── Bad g-ratio markers (GT mode) ──────────────────────────────────
+    if (this.gtMode && this._badGratioFibers && this._badGratioFibers.length > 0) {
+      ctx.save();
+      const br = 16 / this.zoom, blw = 2 / this.zoom;
+      const fontSize = Math.max(9, 11 / this.zoom);
+      ctx.font = `bold ${fontSize}px sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+      for (const f of this._badGratioFibers) {
+        // Red circle
+        ctx.beginPath();
+        ctx.arc(f.x, f.y, br, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(255,60,60,0.9)';
+        ctx.lineWidth = blw;
+        ctx.stroke();
+        // Label
+        ctx.fillStyle = 'rgba(255,60,60,0.9)';
+        ctx.fillText(`g=${f.gratio}`, f.x, f.y - br - 2 / this.zoom);
+      }
       ctx.restore();
     }
 
@@ -1026,7 +1108,10 @@ class App {
       if (this.exclPts.length > 0) this.render();
       return;
     }
-    if (this.drawing) { this.drawPts.push(pt); this.render(); }
+    if (this.drawing) {
+      this.drawPts.push(pt);
+      if (!this._rafId) this._rafId = setTimeout(() => { this._rafId = null; this.render(); }, 40);
+    }
   }
 
   onUp(e) {
@@ -1073,6 +1158,7 @@ class App {
       }
     }
     this.drawing = false; this.drawPts = [];
+    if (this._rafId) { clearTimeout(this._rafId); this._rafId = null; }
     this.render();
   }
 
@@ -1133,7 +1219,7 @@ class App {
       this.spaceHeld = down;
       if (down) {
         e.preventDefault();
-        if (this.drawing) { this.drawing = false; this.drawPts = []; this.render(); }
+        if (this.drawing) { this.drawing = false; this.drawPts = []; if (this._rafId) { clearTimeout(this._rafId); this._rafId = null; } this.render(); }
         $('#viewer').classList.add('space-held');
         const h = document.getElementById('cursor-hint'); if (h) h.style.display = 'none';
       } else {
@@ -1165,7 +1251,7 @@ class App {
         this.drawing = false; this.render(); this.toast('Cancelled', 'info');
       }
       if (['paint-axon', 'paint-outer', 'erase-outer', 'vessel'].includes(this.mode) && this.drawing) {
-        this.drawing = false; this.drawPts = []; this.render(); this.toast('Cancelled', 'info');
+        this.drawing = false; this.drawPts = []; if (this._rafId) { clearTimeout(this._rafId); this._rafId = null; } this.render(); this.toast('Cancelled', 'info');
       }
       if (this.mode === 'fascicle' && this.fascPts.length > 0) {
         this.fascPts = []; this.fascMouse = null; this.render(); this.toast('Cancelled', 'info');
@@ -1475,7 +1561,7 @@ class App {
       : `~${secsEst} sec`;
     const msg =
       `Recompute morphometrics for ${nProcessed} image(s)?\n\n` +
-      `⏱  Estimated: ${timeStr} (QC + visualisations only, no Cellpose)\n\n` +
+      `⏱  Estimated: ${timeStr} (QC + visualisations only, no U-Net inference)\n\n` +
       `✅  The app stays fully usable during the computation.`;
     if (!confirm(msg)) return;
     const btn = $('#btn-recompute-all');
