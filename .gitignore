@@ -9,3 +9,14 @@ axons/
 edited/
 ground_truth/
 STRATEGY.md
+
+# Backups & logs
+*.zip
+vacation_logs/
+
+# Training checkpoints (large binaries)
+train/checkpoints/
+
+# Generated logs
+train/*.log
+*.log
